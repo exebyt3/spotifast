@@ -3265,6 +3265,7 @@ impl Worker {
         let background_api = Arc::clone(&self.background_api);
         let background = request.background();
         let engine = self.engine.clone();
+        let http = self.http.clone();
         let commands = self.commands.clone();
         let mut session = self.session.subscribe();
         let generation = *session.borrow_and_update();
@@ -3277,7 +3278,7 @@ impl Worker {
                     } else {
                         None
                     };
-                    handle(&api, engine.as_deref(), request).await
+                    handle(&api, engine.as_deref(), &http, request).await
                 } => result,
             };
             // Apply completion on the command loop. A late response cannot
@@ -3456,6 +3457,7 @@ fn observe_playlists(api: &ApiGateway, response: &ApiResponse) {
 async fn handle(
     api: &ApiGateway,
     engine: Option<&Engine>,
+    http: &Http,
     request: ApiRequest,
 ) -> (ApiResponse, Option<ApiSource>) {
     let operation = operation_for(api, &request);
@@ -3465,7 +3467,7 @@ async fn handle(
     if api.session_serves(operation)
         && let Some(engine) = engine
             .filter(|engine| same_account(&engine.session().username(), api.account().as_ref()))
-        && let Some(response) = over_session(engine, &request).await
+        && let Some(response) = over_session(engine, http, &request).await
     {
         log::debug!("Spotify route operation={operation:?} source=session");
         observe_playlists(api, &response);
@@ -3890,7 +3892,7 @@ const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Answers a playlist read over the streaming session. `None` when the
 /// session could not, leaving the request to the Web API.
-async fn over_session(engine: &Engine, request: &ApiRequest) -> Option<ApiResponse> {
+async fn over_session(engine: &Engine, http: &Http, request: &ApiRequest) -> Option<ApiResponse> {
     let session = engine.session();
     let read = async {
         Some(match session_read(request)? {
@@ -3920,6 +3922,11 @@ async fn over_session(engine: &Engine, request: &ApiRequest) -> Option<ApiRespon
             SessionRead::RelatedArtists { id } => SessionAnswer::Artists(settle(
                 session_reads::related_artists(session, id).await,
             )?),
+            SessionRead::Search { query } => {
+                SessionAnswer::Results(settle(
+                    crate::pathfinder::search(session, http, query).await,
+                )?)
+            }
         })
     };
     let Ok(answer) = tokio::time::timeout(SESSION_READ_TIMEOUT, read).await else {
@@ -3931,8 +3938,9 @@ async fn over_session(engine: &Engine, request: &ApiRequest) -> Option<ApiRespon
 
 /// The read a request asks of the session: a playlist's header, a page of
 /// its rows, or a sample of who added them, which needs no song details;
-/// or one part of an artist's page. Anything else, a duplicate check among
-/// them, is the Web API's even where the session serves the operation.
+/// one part of an artist's page, or a search. Anything else, a duplicate
+/// check among them, is the Web API's even where the session serves the
+/// operation.
 #[derive(Debug, PartialEq)]
 enum SessionRead<'a> {
     Header { id: &'a str },
@@ -3946,6 +3954,7 @@ enum SessionRead<'a> {
         offset: u32,
     },
     RelatedArtists { id: &'a str },
+    Search { query: &'a str },
 }
 
 fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
@@ -3967,12 +3976,15 @@ fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
             offset: *offset,
         },
         ApiRequest::RelatedArtists { id } => SessionRead::RelatedArtists { id },
+        ApiRequest::Search { query, .. }
+        | ApiRequest::SearchCatalogue { query, .. }
+        | ApiRequest::SearchPlaylists { query, .. } => SessionRead::Search { query },
         _ => return None,
     })
 }
 
-/// What the session read: a playlist's header or a page of its rows, or a
-/// part of an artist's page.
+/// What the session read: a playlist's header or a page of its rows, a
+/// part of an artist's page, or the results of a search.
 enum SessionAnswer {
     Header(ApiResult<Playlist>),
     Rows(ApiResult<Page<PlaylistItem>>),
@@ -3980,6 +3992,7 @@ enum SessionAnswer {
     Tracks(ApiResult<Vec<Track>>),
     Albums(ApiResult<Page<Album>>),
     Artists(ApiResult<Vec<Artist>>),
+    Results(ApiResult<SearchResults>),
 }
 
 /// The response a session answer becomes, carrying the request's own id,
@@ -4035,6 +4048,32 @@ fn session_response(request: &ApiRequest, answer: SessionAnswer) -> Option<ApiRe
             ApiResponse::RelatedArtists {
                 id: id.clone(),
                 result,
+            }
+        }
+        // One answer holds every kind of result; each request keeps the
+        // part it asked for, as the Web API's split searches do.
+        (ApiRequest::Search { query, serial }, SessionAnswer::Results(result)) => {
+            ApiResponse::Search {
+                query: query.clone(),
+                serial: *serial,
+                result,
+            }
+        }
+        (ApiRequest::SearchCatalogue { query, serial }, SessionAnswer::Results(result)) => {
+            ApiResponse::Search {
+                query: query.clone(),
+                serial: *serial,
+                result: result.map(|results| SearchResults {
+                    playlists: None,
+                    ..results
+                }),
+            }
+        }
+        (ApiRequest::SearchPlaylists { query, serial }, SessionAnswer::Results(result)) => {
+            ApiResponse::SearchPlaylists {
+                query: query.clone(),
+                serial: *serial,
+                result: result.map(|results| results.playlists.unwrap_or_default()),
             }
         }
         _ => return None,
