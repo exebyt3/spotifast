@@ -3888,6 +3888,8 @@ const ARTIST_ALBUMS_PAGE_SIZE: u32 = 50;
 
 /// How many liked songs a page of the library holds.
 const SAVED_PAGE_SIZE: u32 = 50;
+/// How many playlists a page of the library list holds.
+const LIBRARY_PAGE_SIZE: u32 = 50;
 
 /// Whether the session's library answers for a URI: songs, albums, shows
 /// and episodes.
@@ -3944,6 +3946,9 @@ async fn over_session(
                     crate::pathfinder::search(session, http, query).await,
                 )?)
             }
+            SessionRead::MyPlaylists { offset } => SessionAnswer::Playlists(settle(
+                crate::pathfinder::my_playlists(session, http, offset, LIBRARY_PAGE_SIZE).await,
+            )?),
             SessionRead::SavedTracks { offset } => SessionAnswer::Saved(settle(
                 crate::pathfinder::saved_tracks(session, http, offset, SAVED_PAGE_SIZE).await,
             )?),
@@ -3964,9 +3969,9 @@ async fn over_session(
 
 /// The read a request asks of the session: a playlist's header, a page of
 /// its rows, or a sample of who added them, which needs no song details;
-/// one part of an artist's page, or a search. Anything else, a duplicate
-/// check among them, is the Web API's even where the session serves the
-/// operation.
+/// one part of an artist's page, a search, the playlist list, or the liked
+/// songs. Anything else, a duplicate check among them, is the Web API's
+/// even where the session serves the operation.
 #[derive(Debug, PartialEq)]
 enum SessionRead<'a> {
     Header { id: &'a str },
@@ -3981,6 +3986,7 @@ enum SessionRead<'a> {
     },
     RelatedArtists { id: &'a str },
     Search { query: &'a str },
+    MyPlaylists { offset: u32 },
     SavedTracks { offset: u32 },
     Contains { uris: &'a [String] },
     SetSaved { uris: &'a [String], saved: bool },
@@ -4008,6 +4014,7 @@ fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
         ApiRequest::Search { query, .. }
         | ApiRequest::SearchCatalogue { query, .. }
         | ApiRequest::SearchPlaylists { query, .. } => SessionRead::Search { query },
+        ApiRequest::MyPlaylists { offset, .. } => SessionRead::MyPlaylists { offset: *offset },
         ApiRequest::SavedTracks { offset, .. } => SessionRead::SavedTracks { offset: *offset },
         // The library answers for songs, albums, shows and episodes; a
         // playlist or an artist in the list is the Web API's.
@@ -4034,6 +4041,7 @@ enum SessionAnswer {
     Albums(ApiResult<Page<Album>>),
     Artists(ApiResult<Vec<Artist>>),
     Results(ApiResult<SearchResults>),
+    Playlists(ApiResult<Page<Playlist>>),
     Saved(ApiResult<Page<SavedTrack>>),
     Flags(ApiResult<Vec<bool>>),
     Changed(ApiResult<()>),
@@ -4122,6 +4130,13 @@ fn session_response(
                 query: query.clone(),
                 serial: *serial,
                 result: result.map(|results| results.playlists.unwrap_or_default()),
+            }
+        }
+        (ApiRequest::MyPlaylists { offset, generation }, SessionAnswer::Playlists(result)) => {
+            ApiResponse::MyPlaylists {
+                offset: *offset,
+                generation: *generation,
+                result,
             }
         }
         (
