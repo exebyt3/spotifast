@@ -101,12 +101,17 @@ pub enum Operation {
 /// The streaming session reads every playlist the shared app would have
 /// been asked for: other people's, which no personal app may read, and the
 /// account's own when it has no personal app. A personal app keeps its own
-/// playlists, which it reads quickly and with every field.
+/// playlists, which it reads quickly and with every field. Catalogue reads
+/// it serves whichever app would have taken them: it has no quota at all,
+/// and it reads what a personal app is refused.
 fn session_serves(operation: Operation, personal_ready: bool) -> bool {
-    matches!(
-        operation,
-        Operation::PlaylistMetadata(_) | Operation::PlaylistItems(_)
-    ) && plan(operation, personal_ready) == ApiSource::Shared
+    match operation {
+        Operation::PlaylistMetadata(_) | Operation::PlaylistItems(_) => {
+            plan(operation, personal_ready) == ApiSource::Shared
+        }
+        Operation::Catalog | Operation::UnsupportedDevelopmentMode => true,
+        _ => false,
+    }
 }
 
 /// A playlist with unknown access dispatches to the shared app, which can
@@ -421,6 +426,9 @@ mod tests {
     fn the_session_reads_what_the_shared_app_would_have() {
         for (operation, personal) in [
             (Operation::PlaylistItems(PlaylistAccess::External), true),
+            (Operation::Catalog, true),
+            (Operation::Catalog, false),
+            (Operation::UnsupportedDevelopmentMode, true),
             (Operation::PlaylistMetadata(PlaylistAccess::Unknown), false),
             (Operation::PlaylistMetadata(PlaylistAccess::Owned), false),
             (
@@ -437,8 +445,8 @@ mod tests {
                 true,
             ),
             (Operation::PlaylistMutation(PlaylistAccess::External), true),
-            (Operation::Catalog, false),
             (Operation::PlaylistLibrary, false),
+            (Operation::CatalogSearch, false),
         ] {
             assert!(!session_serves(operation, personal), "{operation:?}");
         }

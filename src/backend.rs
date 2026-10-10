@@ -3727,7 +3727,7 @@ async fn handle(
             id,
         },
         ApiRequest::ArtistAlbums { id, groups, offset } => ApiResponse::ArtistAlbums {
-            result: routed!(artist_albums(&id, &groups, offset, 50)),
+            result: routed!(artist_albums(&id, &groups, offset, ARTIST_ALBUMS_PAGE_SIZE)),
             id,
             groups,
             offset,
@@ -3880,6 +3880,9 @@ fn same_account(username: &str, account: Option<&AccountId>) -> bool {
     account.is_some_and(|account| account.as_str() == username)
 }
 
+/// How many releases a page of an artist's discography holds.
+const ARTIST_ALBUMS_PAGE_SIZE: u32 = 50;
+
 /// How long a session read may take before the Web API is asked instead:
 /// what the Web API's own requests get. A stalled line otherwise waits on
 /// the operating system, which is far longer than a page should spin.
@@ -3900,6 +3903,23 @@ async fn over_session(engine: &Engine, request: &ApiRequest) -> Option<ApiRespon
             SessionRead::Sample { id, offset } => SessionAnswer::Rows(settle(
                 session_reads::sample(session, id, offset, PLAYLIST_PAGE_SIZE).await,
             )?),
+            SessionRead::Artist { id } => {
+                SessionAnswer::Artist(settle(session_reads::artist(session, id).await)?)
+            }
+            SessionRead::ArtistTopTracks { id } => SessionAnswer::Tracks(settle(
+                session_reads::artist_top_tracks(session, id).await,
+            )?),
+            SessionRead::ArtistAlbums {
+                id,
+                groups,
+                offset,
+            } => SessionAnswer::Albums(settle(
+                session_reads::artist_albums(session, id, groups, offset, ARTIST_ALBUMS_PAGE_SIZE)
+                    .await,
+            )?),
+            SessionRead::RelatedArtists { id } => SessionAnswer::Artists(settle(
+                session_reads::related_artists(session, id).await,
+            )?),
         })
     };
     let Ok(answer) = tokio::time::timeout(SESSION_READ_TIMEOUT, read).await else {
@@ -3910,14 +3930,22 @@ async fn over_session(engine: &Engine, request: &ApiRequest) -> Option<ApiRespon
 }
 
 /// The read a request asks of the session: a playlist's header, a page of
-/// its rows, or a sample of who added them, which needs no song details.
-/// Anything else, a duplicate check among them, is the Web API's even
-/// where the session serves the operation.
+/// its rows, or a sample of who added them, which needs no song details;
+/// or one part of an artist's page. Anything else, a duplicate check among
+/// them, is the Web API's even where the session serves the operation.
 #[derive(Debug, PartialEq)]
 enum SessionRead<'a> {
     Header { id: &'a str },
     Rows { id: &'a str, offset: u32 },
     Sample { id: &'a str, offset: u32 },
+    Artist { id: &'a str },
+    ArtistTopTracks { id: &'a str },
+    ArtistAlbums {
+        id: &'a str,
+        groups: &'a str,
+        offset: u32,
+    },
+    RelatedArtists { id: &'a str },
 }
 
 fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
@@ -3931,14 +3959,27 @@ fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
             id,
             offset: *offset,
         },
+        ApiRequest::Artist { id } => SessionRead::Artist { id },
+        ApiRequest::ArtistTopTracks { id } => SessionRead::ArtistTopTracks { id },
+        ApiRequest::ArtistAlbums { id, groups, offset } => SessionRead::ArtistAlbums {
+            id,
+            groups,
+            offset: *offset,
+        },
+        ApiRequest::RelatedArtists { id } => SessionRead::RelatedArtists { id },
         _ => return None,
     })
 }
 
-/// What the session read: a playlist's header, or a page of its rows.
+/// What the session read: a playlist's header or a page of its rows, or a
+/// part of an artist's page.
 enum SessionAnswer {
     Header(ApiResult<Playlist>),
     Rows(ApiResult<Page<PlaylistItem>>),
+    Artist(ApiResult<Artist>),
+    Tracks(ApiResult<Vec<Track>>),
+    Albums(ApiResult<Page<Album>>),
+    Artists(ApiResult<Vec<Artist>>),
 }
 
 /// The response a session answer becomes, carrying the request's own id,
@@ -3969,6 +4010,30 @@ fn session_response(request: &ApiRequest, answer: SessionAnswer) -> Option<ApiRe
             ApiResponse::PlaylistSample {
                 id: id.clone(),
                 generation: *generation,
+                result,
+            }
+        }
+        (ApiRequest::Artist { id }, SessionAnswer::Artist(result)) => ApiResponse::Artist {
+            id: id.clone(),
+            result,
+        },
+        (ApiRequest::ArtistTopTracks { id }, SessionAnswer::Tracks(result)) => {
+            ApiResponse::ArtistTopTracks {
+                id: id.clone(),
+                result,
+            }
+        }
+        (ApiRequest::ArtistAlbums { id, groups, offset }, SessionAnswer::Albums(result)) => {
+            ApiResponse::ArtistAlbums {
+                id: id.clone(),
+                groups: groups.clone(),
+                offset: *offset,
+                result,
+            }
+        }
+        (ApiRequest::RelatedArtists { id }, SessionAnswer::Artists(result)) => {
+            ApiResponse::RelatedArtists {
+                id: id.clone(),
                 result,
             }
         }
