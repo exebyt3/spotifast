@@ -1,11 +1,13 @@
-//! Search over the web player's GraphQL endpoint, with the streaming
-//! session's own token. Spotify's clients search there, and it has no
-//! per-app quota, so a search does not wait on the shared app's rate limit.
+//! Search and the library of liked songs over the web player's GraphQL
+//! endpoint, with the streaming session's own token. Spotify's clients ask
+//! there, and it has no per-app quota, so neither waits on the shared app's
+//! rate limit.
 //!
-//! The query is a persisted one, named by a hash that Spotify moves with
-//! each web player release. A stale hash is refreshed from the player's own
-//! bundle; any other failure is left to the Web API.
+//! Each operation is a persisted one, named by a hash that Spotify moves
+//! with each web player release. A stale hash is refreshed from the
+//! player's own bundle; any other failure is left to the Web API.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use librespot_core::Session;
@@ -13,28 +15,42 @@ use serde_json::{Value, json};
 
 use crate::http::Http;
 use crate::api::models::{
-    Album, Artist, ArtistRef, Episode, Image, Owner, Page, Playlist, SearchResults, Show, Track,
+    Album, Artist, ArtistRef, Episode, Image, Owner, Page, Playlist, SavedTrack, SearchResults,
+    Show, Track,
 };
 use crate::session_reads::Failure;
 
 const ENDPOINT: &str = "https://api-partner.spotify.com/pathfinder/v1/query";
 const WEB_PLAYER: &str = "https://open.spotify.com/";
-const SEARCH_OPERATION: &str = "searchDesktop";
-/// The web player's route chunk that carries the search operations.
+/// The web player's route chunk that carries the search operations; the
+/// library's are in the main bundle.
 const SEARCH_CHUNK: &str = "xpui-routes-search";
-/// The `searchDesktop` hash of the web player build of 2026-10-10.
-const KNOWN_HASH: &str = "eef7cc54888d91bdd6802623477873caa3948ae173a0c34fd86827b267e94c03";
-/// What the shared app's search answers with per kind of result.
-const RESULTS_PER_KIND: u32 = 20;
 /// What the web player sends the desktop page to.
 const BROWSER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+/// What the shared app's search answers with per kind of result.
+const RESULTS_PER_KIND: u32 = 20;
 const STALE_QUERY: &str = "PersistedQueryNotFound";
 
-/// The hash found in the web player once the known one went stale.
-static FRESH_HASH: Mutex<Option<String>> = Mutex::new(None);
+const SEARCH: &str = "searchDesktop";
+const SAVED_TRACKS: &str = "fetchLibraryTracks";
+const CONTAINS: &str = "areEntitiesInLibrary";
+const SAVE: &str = "addToLibrary";
+const UNSAVE: &str = "removeFromLibrary";
+
+/// The hashes of the web player build of 2026-10-10, by operation.
+const KNOWN_HASHES: [(&str, &str); 5] = [
+    (SEARCH, "eef7cc54888d91bdd6802623477873caa3948ae173a0c34fd86827b267e94c03"),
+    (SAVED_TRACKS, "087278b20b743578a6262c2b0b4bcd20d879c503cc359a2285baf083ef944240"),
+    (CONTAINS, "134337999233cc6fdd6b1e6dbf94841409f04a946c5c7b744b09ba0dfe5a85ed"),
+    (SAVE, "896ebcb47815681340860d121cb5d494e157e2a78d3950385cd54e0393c67148"),
+    (UNSAVE, "896ebcb47815681340860d121cb5d494e157e2a78d3950385cd54e0393c67148"),
+];
+
+/// The hashes found in the web player once a known one went stale.
+static FRESH_HASHES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
 enum Reply {
-    Results(Value),
+    Data(Value),
     Stale,
 }
 
@@ -44,35 +60,6 @@ pub async fn search(
     http: &Http,
     query: &str,
 ) -> Result<SearchResults, Failure> {
-    let hash = current_hash();
-    let reply = fetch(session, query, &hash).await?;
-    let results = match reply {
-        Reply::Results(results) => results,
-        Reply::Stale => {
-            let fresh = scrape_hash(http).await?;
-            *FRESH_HASH.lock().unwrap_or_else(|lock| lock.into_inner()) = Some(fresh.clone());
-            match fetch(session, query, &fresh).await? {
-                Reply::Results(results) => results,
-                Reply::Stale => {
-                    return Err(Failure::Retry(anyhow::anyhow!("search hash refused")));
-                }
-            }
-        }
-    };
-    Ok(results_of(&results))
-}
-
-fn current_hash() -> String {
-    FRESH_HASH
-        .lock()
-        .unwrap_or_else(|lock| lock.into_inner())
-        .clone()
-        .unwrap_or_else(|| KNOWN_HASH.to_string())
-}
-
-async fn fetch(session: &Session, query: &str, hash: &str) -> Result<Reply, Failure> {
-    let token = session.login5().auth_token().await?.access_token;
-    let client_token = session.spclient().client_token().await?;
     let variables = json!({
         "searchTerm": query,
         "offset": 0,
@@ -84,25 +71,175 @@ async fn fetch(session: &Session, query: &str, hash: &str) -> Result<Reply, Fail
         "includeLocalConcertsField": false,
         "includeAuthors": false,
     });
+    let data = run(session, http, SEARCH, variables, false).await?;
+    match data.get("searchV2") {
+        Some(results) => Ok(results_of(results)),
+        None => Err(Failure::Retry(anyhow::anyhow!("search answered no results"))),
+    }
+}
+
+/// One page of the account's liked songs, newest first, as the Web API's
+/// saved tracks page.
+pub async fn saved_tracks(
+    session: &Session,
+    http: &Http,
+    offset: u32,
+    limit: u32,
+) -> Result<Page<SavedTrack>, Failure> {
+    let variables = json!({"offset": offset, "limit": limit});
+    let data = run(session, http, SAVED_TRACKS, variables, false).await?;
+    saved_page(&data, offset, limit)
+}
+
+fn saved_page(data: &Value, offset: u32, limit: u32) -> Result<Page<SavedTrack>, Failure> {
+    let tracks = data
+        .pointer("/me/library/tracks")
+        .ok_or_else(|| Failure::Retry(anyhow::anyhow!("library answered no tracks")))?;
+    let items: Vec<SavedTrack> = tracks["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            // A song Spotify no longer lists answers without its fields.
+            let uri = entry["track"]["_uri"].as_str()?;
+            Some(SavedTrack {
+                added_at: entry["addedAt"]["isoString"].as_str().map(str::to_string),
+                track: track_of(uri, &entry["track"]["data"])?,
+            })
+        })
+        .collect();
+    let shown = offset.saturating_add(items.len() as u32);
+    let total = tracks["totalCount"]
+        .as_u64()
+        .and_then(|total| u32::try_from(total).ok())
+        .unwrap_or(shown);
+    Ok(Page {
+        next: (shown < total).then(String::new),
+        items,
+        total,
+        limit,
+        offset,
+    })
+}
+
+/// Whether each of `uris` is in the library, in the same order. Songs,
+/// albums, shows and episodes only: the answer for any other kind is the
+/// Web API's.
+pub async fn contains(
+    session: &Session,
+    http: &Http,
+    uris: &[String],
+) -> Result<Vec<bool>, Failure> {
+    let data = run(session, http, CONTAINS, json!({"uris": uris}), false).await?;
+    saved_flags(&data, uris.len())
+}
+
+/// The `saved` flag of each of `count` entries, in the order asked.
+fn saved_flags(data: &Value, count: usize) -> Result<Vec<bool>, Failure> {
+    match data["lookup"].as_array() {
+        Some(lookup) if lookup.len() == count => Ok(lookup
+            .iter()
+            .map(|entry| entry["data"]["saved"].as_bool().unwrap_or(false))
+            .collect()),
+        other => Err(Failure::Retry(anyhow::anyhow!(
+            "library answered {} entries for {count} uris",
+            other.map_or(0, Vec::len),
+        ))),
+    }
+}
+
+/// Adds `uris` to the library, or takes them out.
+pub async fn set_saved(
+    session: &Session,
+    http: &Http,
+    uris: &[String],
+    saved: bool,
+) -> Result<(), Failure> {
+    let operation = if saved { SAVE } else { UNSAVE };
+    let variables = json!({"libraryItemUris": uris});
+    run(session, http, operation, variables, true).await?;
+    Ok(())
+}
+
+/// Runs a persisted operation and returns its `data`. A stale hash is
+/// refreshed from the web player and the operation asked once more.
+async fn run(
+    session: &Session,
+    http: &Http,
+    operation: &str,
+    variables: Value,
+    write: bool,
+) -> Result<Value, Failure> {
+    let known = current_hash(operation)
+        .ok_or_else(|| Failure::Retry(anyhow::anyhow!("no hash for {operation}")))?;
+    if let Reply::Data(data) = fetch(session, operation, &variables, &known, write).await? {
+        return Ok(data);
+    }
+    let fresh = scrape_hash(http, operation).await?;
+    FRESH_HASHES
+        .lock()
+        .unwrap_or_else(|lock| lock.into_inner())
+        .insert(operation.to_string(), fresh.clone());
+    match fetch(session, operation, &variables, &fresh, write).await? {
+        Reply::Data(data) => Ok(data),
+        Reply::Stale => Err(Failure::Retry(anyhow::anyhow!("{operation} hash refused"))),
+    }
+}
+
+fn current_hash(operation: &str) -> Option<String> {
+    let fresh = FRESH_HASHES
+        .lock()
+        .unwrap_or_else(|lock| lock.into_inner())
+        .get(operation)
+        .cloned();
+    fresh.or_else(|| {
+        KNOWN_HASHES
+            .iter()
+            .find(|(name, _)| *name == operation)
+            .map(|(_, hash)| hash.to_string())
+    })
+}
+
+async fn fetch(
+    session: &Session,
+    operation: &str,
+    variables: &Value,
+    hash: &str,
+    write: bool,
+) -> Result<Reply, Failure> {
+    let token = session.login5().auth_token().await?.access_token;
+    let client_token = session.spclient().client_token().await?;
     let extensions = json!({"persistedQuery": {"version": 1, "sha256Hash": hash}});
-    let url = format!(
-        "{ENDPOINT}?operationName={SEARCH_OPERATION}&variables={}&extensions={}",
-        urlencoding::encode(&variables.to_string()),
-        urlencoding::encode(&extensions.to_string()),
-    );
-    let request = http::Request::builder()
-        .uri(url)
+    let builder = http::Request::builder()
         .header("Authorization", format!("Bearer {token}"))
         .header("client-token", client_token)
         .header("Accept", "application/json")
-        .header("App-Platform", "Win32_x86_64")
-        .body(Default::default())
-        .map_err(|error| Failure::Retry(error.into()))?;
+        .header("App-Platform", "Win32_x86_64");
+    let request = if write {
+        let body = json!({
+            "operationName": operation,
+            "variables": variables,
+            "extensions": extensions,
+        });
+        builder
+            .method("POST")
+            .uri(ENDPOINT)
+            .header("Content-Type", "application/json;charset=UTF-8")
+            .body(body.to_string().into_bytes().into())
+    } else {
+        let url = format!(
+            "{ENDPOINT}?operationName={operation}&variables={}&extensions={}",
+            urlencoding::encode(&variables.to_string()),
+            urlencoding::encode(&extensions.to_string()),
+        );
+        builder.uri(url).body(Default::default())
+    }
+    .map_err(|error| Failure::Retry(error.into()))?;
     let body = session
         .http_client()
         .request_body(request)
         .await
-        .map_err(|error| Failure::Retry(anyhow::anyhow!("search request: {error}")))?;
+        .map_err(|error| Failure::Retry(anyhow::anyhow!("{operation} request: {error}")))?;
     let value: Value =
         serde_json::from_slice(&body).map_err(|error| Failure::Retry(error.into()))?;
     if let Some(errors) = value.get("errors").and_then(Value::as_array)
@@ -114,19 +251,19 @@ async fn fetch(session: &Session, query: &str, hash: &str) -> Result<Reply, Fail
         return if stale {
             Ok(Reply::Stale)
         } else {
-            Err(Failure::Retry(anyhow::anyhow!("search refused: {errors:?}")))
+            Err(Failure::Retry(anyhow::anyhow!("{operation} refused: {errors:?}")))
         };
     }
-    match value.pointer("/data/searchV2") {
-        Some(results) => Ok(Reply::Results(results.clone())),
-        None => Err(Failure::Retry(anyhow::anyhow!("search answered no results"))),
+    match value.get("data") {
+        Some(data) if data.is_object() => Ok(Reply::Data(data.clone())),
+        _ => Err(Failure::Retry(anyhow::anyhow!("{operation} answered no data"))),
     }
 }
 
-/// The current `searchDesktop` hash: the player's page names its main
-/// bundle, the bundle maps route names to their chunk files, and the search
-/// chunk carries the operations with their hashes.
-async fn scrape_hash(http: &Http) -> Result<String, Failure> {
+/// The current hash of `operation`: the player's page names its main
+/// bundle, which carries the library's operations, and maps route names to
+/// the chunk files that carry the rest, search among them.
+async fn scrape_hash(http: &Http, operation: &str) -> Result<String, Failure> {
     let retry = |reason: &str| Failure::Retry(anyhow::anyhow!("web player: {reason}"));
     let page = download(http, WEB_PLAYER).await?;
     let bundle_url = script_url(&page, "web-player/web-player.").ok_or_else(|| {
@@ -134,6 +271,9 @@ async fn scrape_hash(http: &Http) -> Result<String, Failure> {
         retry(&format!("no main bundle in {} bytes: {head}", page.len()))
     })?;
     let bundle = download(http, &bundle_url).await?;
+    if let Some(hash) = operation_hash(&bundle, operation) {
+        return Ok(hash);
+    }
     let id = chunk_id(&bundle, SEARCH_CHUNK).ok_or_else(|| retry("no search chunk"))?;
     let file = chunk_file(&bundle, &id).ok_or_else(|| retry("no search chunk file"))?;
     let base = bundle_url
@@ -141,7 +281,7 @@ async fn scrape_hash(http: &Http) -> Result<String, Failure> {
         .map(|(base, _)| base.to_string())
         .ok_or_else(|| retry("odd bundle address"))?;
     let chunk = download(http, &format!("{base}{SEARCH_CHUNK}.{file}.js")).await?;
-    operation_hash(&chunk, SEARCH_OPERATION).ok_or_else(|| retry("no search operation"))
+    operation_hash(&chunk, operation).ok_or_else(|| retry("no such operation"))
 }
 
 /// A page of the web player. Its address list depends on who asks: a
@@ -219,13 +359,15 @@ fn chunk_file(bundle: &str, id: &str) -> Option<String> {
 }
 
 /// The hash of a persisted operation, as in `"searchDesktop","query","<hash>"`.
-fn operation_hash(chunk: &str, operation: &str) -> Option<String> {
-    let head = format!("\"{operation}\",\"query\",\"");
-    let start = chunk.find(&head)? + head.len();
-    let hash = chunk.get(start..start + 64)?;
-    hash.chars()
-        .all(|c| c.is_ascii_hexdigit())
-        .then(|| hash.to_string())
+fn operation_hash(source: &str, operation: &str) -> Option<String> {
+    ["query", "mutation"].iter().find_map(|kind| {
+        let head = format!("\"{operation}\",\"{kind}\",\"");
+        let start = source.find(&head)? + head.len();
+        let hash = source.get(start..start + 64)?;
+        hash.chars()
+            .all(|c| c.is_ascii_hexdigit())
+            .then(|| hash.to_string())
+    })
 }
 
 fn results_of(results: &Value) -> SearchResults {
@@ -274,11 +416,16 @@ fn page<T>(
 }
 
 fn track(data: &Value) -> Option<Track> {
+    track_of(data["uri"].as_str()?, data)
+}
+
+/// A song under `uri`; the library's rows name it beside the details.
+fn track_of(uri: &str, data: &Value) -> Option<Track> {
     if data["__typename"] != "Track" {
         return None;
     }
-    let uri = data["uri"].as_str()?;
     let album = &data["albumOfTrack"];
+    let number = |value: &Value| value.as_u64().and_then(|n| u32::try_from(n).ok());
     Some(Track {
         id: Some(id_of(uri)),
         uri: uri.to_string(),
@@ -293,6 +440,8 @@ fn track(data: &Value) -> Option<Track> {
             images: images(&album["coverArt"]["sources"]),
             ..Default::default()
         }),
+        track_number: number(&data["trackNumber"]),
+        disc_number: number(&data["discNumber"]),
         is_playable: data["playability"]["playable"].as_bool(),
         ..Default::default()
     })
@@ -568,6 +717,52 @@ mod tests {
     }
 
     #[test]
+    fn liked_songs_read_as_a_web_api_page() {
+        let data = json!({"me": {"library": {"tracks": {
+            "totalCount": 10407,
+            "items": [
+                {"addedAt": {"isoString": "2026-10-10T10:12:40Z"},
+                 "track": {"_uri": "spotify:track:1nBxszQgD8kHACCWMFEm5Z", "data": {
+                    "__typename": "Track", "name": "Mode", "trackNumber": 1, "discNumber": 1,
+                    "duration": {"totalMilliseconds": 188476},
+                    "contentRating": {"label": "EXPLICIT"},
+                    "artists": {"items": [{"uri": "spotify:artist:6a4D", "profile": {"name": "MBP Mayo"}}]},
+                    "albumOfTrack": {"uri": "spotify:album:4JRq", "name": "Mode", "coverArt": {"sources": []}}
+                 }}},
+                {"addedAt": {"isoString": "2026-10-09T10:00:00Z"},
+                 "track": {"_uri": "spotify:track:gone", "data": {"__typename": "NotFound"}}}
+            ]
+        }}}});
+        let page = saved_page(&data, 100, 50).unwrap();
+        assert_eq!(page.total, 10407);
+        assert_eq!(page.offset, 100);
+        assert_eq!(page.items.len(), 1, "a song Spotify no longer lists is left out");
+        assert!(page.next.is_some(), "more remain");
+        assert_eq!(
+            page.items[0].added_at.as_deref(),
+            Some("2026-10-10T10:12:40Z")
+        );
+        let song = &page.items[0].track;
+        assert_eq!(song.uri, "spotify:track:1nBxszQgD8kHACCWMFEm5Z");
+        assert_eq!(song.id.as_deref(), Some("1nBxszQgD8kHACCWMFEm5Z"));
+        assert_eq!(song.track_number, Some(1));
+        assert!(song.explicit);
+        assert_eq!(song.artists[0].name, "MBP Mayo");
+        assert!(saved_page(&json!({}), 0, 50).is_err());
+    }
+
+    #[test]
+    fn membership_answers_in_the_order_asked() {
+        let data = json!({"lookup": [
+            {"data": {"__typename": "Track", "saved": true}},
+            {"data": {"__typename": "Album", "saved": false}},
+        ]});
+        assert_eq!(saved_flags(&data, 2).unwrap(), vec![true, false]);
+        assert!(saved_flags(&data, 3).is_err(), "a short answer is not trusted");
+        assert!(saved_flags(&json!({}), 1).is_err());
+    }
+
+    #[test]
     fn a_kind_the_answer_lacks_is_none() {
         let results = results_of(&json!({"artists": {"items": []}}));
         assert!(results.tracks.is_none());
@@ -590,12 +785,18 @@ mod tests {
         assert_eq!(chunk_file(bundle, "9999"), None);
 
         let chunk = format!(
-            r#"("searchArtists","query","{}",null),("searchDesktop","query","{KNOWN_HASH}",null)"#,
-            "7".repeat(64)
+            r#"("searchArtists","query","{}",null),("searchDesktop","query","{hash}",null),("addToLibrary","mutation","{hash}",null)"#,
+            "7".repeat(64),
+            hash = KNOWN_HASHES[0].1,
         );
         assert_eq!(
             operation_hash(&chunk, "searchDesktop").as_deref(),
-            Some(KNOWN_HASH)
+            Some(KNOWN_HASHES[0].1)
+        );
+        assert_eq!(
+            operation_hash(&chunk, "addToLibrary").as_deref(),
+            Some(KNOWN_HASHES[0].1),
+            "a mutation is named the same way"
         );
         assert_eq!(operation_hash(&chunk, "searchNothing"), None);
     }

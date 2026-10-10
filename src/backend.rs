@@ -3461,13 +3461,14 @@ async fn handle(
     request: ApiRequest,
 ) -> (ApiResponse, Option<ApiSource>) {
     let operation = operation_for(api, &request);
+    let account_id = api.account().map(|account| account.as_str().to_string());
     // A session whose long-lived connection has dropped still answers over
     // its HTTP client, so the engine's presence is the only liveness test;
     // a read the session truly cannot make falls back to the Web API below.
     if api.session_serves(operation)
         && let Some(engine) = engine
             .filter(|engine| same_account(&engine.session().username(), api.account().as_ref()))
-        && let Some(response) = over_session(engine, http, &request).await
+        && let Some(response) = over_session(engine, http, &request, account_id.clone()).await
     {
         log::debug!("Spotify route operation={operation:?} source=session");
         observe_playlists(api, &response);
@@ -3666,7 +3667,7 @@ async fn handle(
         ApiRequest::SavedTracks { offset, generation } => ApiResponse::SavedTracks {
             offset,
             generation,
-            account_id: api.account().map(|account| account.as_str().to_string()),
+            account_id: account_id.clone(),
             result: routed!(saved_tracks(offset, 50)),
         },
         ApiRequest::SavedAlbums { offset } => ApiResponse::SavedAlbums {
@@ -3885,6 +3886,17 @@ fn same_account(username: &str, account: Option<&AccountId>) -> bool {
 /// How many releases a page of an artist's discography holds.
 const ARTIST_ALBUMS_PAGE_SIZE: u32 = 50;
 
+/// How many liked songs a page of the library holds.
+const SAVED_PAGE_SIZE: u32 = 50;
+
+/// Whether the session's library answers for a URI: songs, albums, shows
+/// and episodes.
+fn in_library(uri: &str) -> bool {
+    ["track", "album", "show", "episode"]
+        .iter()
+        .any(|kind| uri.starts_with(&format!("spotify:{kind}:")))
+}
+
 /// How long a session read may take before the Web API is asked instead:
 /// what the Web API's own requests get. A stalled line otherwise waits on
 /// the operating system, which is far longer than a page should spin.
@@ -3892,7 +3904,12 @@ const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Answers a playlist read over the streaming session. `None` when the
 /// session could not, leaving the request to the Web API.
-async fn over_session(engine: &Engine, http: &Http, request: &ApiRequest) -> Option<ApiResponse> {
+async fn over_session(
+    engine: &Engine,
+    http: &Http,
+    request: &ApiRequest,
+    account_id: Option<String>,
+) -> Option<ApiResponse> {
     let session = engine.session();
     let read = async {
         Some(match session_read(request)? {
@@ -3927,13 +3944,22 @@ async fn over_session(engine: &Engine, http: &Http, request: &ApiRequest) -> Opt
                     crate::pathfinder::search(session, http, query).await,
                 )?)
             }
+            SessionRead::SavedTracks { offset } => SessionAnswer::Saved(settle(
+                crate::pathfinder::saved_tracks(session, http, offset, SAVED_PAGE_SIZE).await,
+            )?),
+            SessionRead::Contains { uris } => SessionAnswer::Flags(settle(
+                crate::pathfinder::contains(session, http, uris).await,
+            )?),
+            SessionRead::SetSaved { uris, saved } => SessionAnswer::Changed(settle(
+                crate::pathfinder::set_saved(session, http, uris, saved).await,
+            )?),
         })
     };
     let Ok(answer) = tokio::time::timeout(SESSION_READ_TIMEOUT, read).await else {
         log::debug!("session read timed out; asking the Web API");
         return None;
     };
-    session_response(request, answer?)
+    session_response(request, answer?, account_id)
 }
 
 /// The read a request asks of the session: a playlist's header, a page of
@@ -3955,6 +3981,9 @@ enum SessionRead<'a> {
     },
     RelatedArtists { id: &'a str },
     Search { query: &'a str },
+    SavedTracks { offset: u32 },
+    Contains { uris: &'a [String] },
+    SetSaved { uris: &'a [String], saved: bool },
 }
 
 fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
@@ -3979,6 +4008,18 @@ fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
         ApiRequest::Search { query, .. }
         | ApiRequest::SearchCatalogue { query, .. }
         | ApiRequest::SearchPlaylists { query, .. } => SessionRead::Search { query },
+        ApiRequest::SavedTracks { offset, .. } => SessionRead::SavedTracks { offset: *offset },
+        // The library answers for songs, albums, shows and episodes; a
+        // playlist or an artist in the list is the Web API's.
+        ApiRequest::Contains { uris } if uris.iter().all(|uri| in_library(uri)) => {
+            SessionRead::Contains { uris }
+        }
+        ApiRequest::SetSaved { uris, saved } if uris.iter().all(|uri| in_library(uri)) => {
+            SessionRead::SetSaved {
+                uris,
+                saved: *saved,
+            }
+        }
         _ => return None,
     })
 }
@@ -3993,11 +4034,18 @@ enum SessionAnswer {
     Albums(ApiResult<Page<Album>>),
     Artists(ApiResult<Vec<Artist>>),
     Results(ApiResult<SearchResults>),
+    Saved(ApiResult<Page<SavedTrack>>),
+    Flags(ApiResult<Vec<bool>>),
+    Changed(ApiResult<()>),
 }
 
 /// The response a session answer becomes, carrying the request's own id,
 /// offset, and generation so the app matches it to the page that asked.
-fn session_response(request: &ApiRequest, answer: SessionAnswer) -> Option<ApiResponse> {
+fn session_response(
+    request: &ApiRequest,
+    answer: SessionAnswer,
+    account_id: Option<String>,
+) -> Option<ApiResponse> {
     Some(match (request, answer) {
         (ApiRequest::Playlist { id, generation }, SessionAnswer::Header(result)) => {
             ApiResponse::Playlist {
@@ -4074,6 +4122,26 @@ fn session_response(request: &ApiRequest, answer: SessionAnswer) -> Option<ApiRe
                 query: query.clone(),
                 serial: *serial,
                 result: result.map(|results| results.playlists.unwrap_or_default()),
+            }
+        }
+        (
+            ApiRequest::SavedTracks { offset, generation },
+            SessionAnswer::Saved(result),
+        ) => ApiResponse::SavedTracks {
+            offset: *offset,
+            generation: *generation,
+            account_id,
+            result,
+        },
+        (ApiRequest::Contains { uris }, SessionAnswer::Flags(result)) => ApiResponse::Contains {
+            uris: uris.clone(),
+            result,
+        },
+        (ApiRequest::SetSaved { uris, saved }, SessionAnswer::Changed(result)) => {
+            ApiResponse::SavedChanged {
+                uris: uris.clone(),
+                saved: *saved,
+                result,
             }
         }
         _ => return None,
@@ -6192,6 +6260,38 @@ mod session_tests {
         };
         assert_eq!(session_read(&duplicates), None);
         assert_eq!(session_read(&ApiRequest::Me), None);
+
+        let songs = vec!["spotify:track:1nBxszQgD8kHACCWMFEm5Z".to_string()];
+        let mixed = vec![
+            "spotify:track:1nBxszQgD8kHACCWMFEm5Z".to_string(),
+            "spotify:playlist:37i9dQZF1DXbIbVYph0Zr5".to_string(),
+        ];
+        assert_eq!(
+            session_read(&ApiRequest::SetSaved {
+                uris: songs.clone(),
+                saved: true
+            }),
+            Some(SessionRead::SetSaved {
+                uris: &songs,
+                saved: true
+            })
+        );
+        assert_eq!(
+            session_read(&ApiRequest::Contains { uris: songs.clone() }),
+            Some(SessionRead::Contains { uris: &songs })
+        );
+        assert_eq!(
+            session_read(&ApiRequest::Contains { uris: mixed.clone() }),
+            None,
+            "a playlist in the list is the Web API's"
+        );
+        assert_eq!(
+            session_read(&ApiRequest::SetSaved {
+                uris: mixed,
+                saved: false
+            }),
+            None
+        );
     }
 
     /// A session answer reaches the app as the Web API's would: a value, a
@@ -6223,7 +6323,7 @@ mod session_tests {
             generation: 7,
         };
         assert!(matches!(
-            session_response(&items, rows()),
+            session_response(&items, rows(), None),
             Some(ApiResponse::PlaylistItems { id, offset: 150, generation: 7, result: Ok(_) }) if id == "pl1"
         ));
         let sample = ApiRequest::PlaylistSample {
@@ -6232,7 +6332,7 @@ mod session_tests {
             generation: 7,
         };
         assert!(matches!(
-            session_response(&sample, rows()),
+            session_response(&sample, rows(), None),
             Some(ApiResponse::PlaylistSample { id, generation: 7, result: Ok(_) }) if id == "pl1"
         ));
         let playlist = ApiRequest::Playlist {
@@ -6240,15 +6340,15 @@ mod session_tests {
             generation: 7,
         };
         assert!(matches!(
-            session_response(&playlist, header()),
+            session_response(&playlist, header(), None),
             Some(ApiResponse::Playlist { id, generation: 7, result: Ok(_) }) if id == "pl1"
         ));
         assert!(
-            session_response(&playlist, rows()).is_none(),
+            session_response(&playlist, rows(), None).is_none(),
             "rows are no header"
         );
         assert!(
-            session_response(&ApiRequest::Me, header()).is_none(),
+            session_response(&ApiRequest::Me, header(), None).is_none(),
             "nothing else is served here"
         );
     }

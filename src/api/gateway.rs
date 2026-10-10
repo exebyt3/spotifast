@@ -102,8 +102,9 @@ pub enum Operation {
 /// been asked for: other people's, which no personal app may read, and the
 /// account's own when it has no personal app. A personal app keeps its own
 /// playlists, which it reads quickly and with every field. Catalogue reads
-/// it serves whichever app would have taken them, searches among them: it
-/// has no quota at all, and it reads what a personal app is refused.
+/// it serves whichever app would have taken them, searches and the liked
+/// songs among them: it has no quota at all, and it reads what a personal
+/// app is refused.
 fn session_serves(operation: Operation, personal_ready: bool) -> bool {
     match operation {
         Operation::PlaylistMetadata(_) | Operation::PlaylistItems(_) => {
@@ -112,6 +113,7 @@ fn session_serves(operation: Operation, personal_ready: bool) -> bool {
         Operation::Catalog
         | Operation::CatalogSearch
         | Operation::PlaylistSearch
+        | Operation::UserData
         | Operation::UnsupportedDevelopmentMode => true,
         _ => false,
     }
