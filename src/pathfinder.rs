@@ -641,9 +641,7 @@ fn results_of(results: &Value) -> SearchResults {
         albums: page(results, "/albumsV2/items", "/albumsV2", |entry| {
             album(&entry["data"])
         }),
-        playlists: page(results, "/playlists/items", "/playlists", |entry| {
-            playlist(&entry["data"])
-        }),
+        playlists: playlists_of(results),
         shows: page(results, "/podcasts/items", "/podcasts", |entry| {
             show(&entry["data"])
         }),
@@ -651,6 +649,41 @@ fn results_of(results: &Value) -> SearchResults {
             episode(&entry["data"])
         }),
     }
+}
+
+/// The playlists, led by those among the top results: Spotify's personal
+/// mixes (Chill Mix and the like) come only there, with the playlists
+/// section itself often left empty.
+fn playlists_of(results: &Value) -> Option<Page<Playlist>> {
+    let listed = page(results, "/playlists/items", "/playlists", |entry| {
+        playlist(&entry["data"])
+    });
+    let top: Vec<Playlist> = results
+        .pointer("/topResultsV2/itemsV2")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter_map(|entry| playlist(&entry["item"]["data"]))
+        .collect();
+    if top.is_empty() {
+        return listed;
+    }
+    let mut merged = listed.unwrap_or(Page {
+        total: 0,
+        limit: RESULTS_PER_KIND,
+        offset: 0,
+        next: None,
+        items: Vec::new(),
+    });
+    let mut seen = std::collections::HashSet::new();
+    let items: Vec<Playlist> = top
+        .into_iter()
+        .chain(std::mem::take(&mut merged.items))
+        .filter(|playlist| seen.insert(playlist.uri.clone()))
+        .collect();
+    merged.total = merged.total.max(u32::try_from(items.len()).unwrap_or(u32::MAX));
+    merged.items = items;
+    Some(merged)
 }
 
 /// One kind of result as a page; `None` when the answer holds none of it.
@@ -979,6 +1012,35 @@ mod tests {
         assert_eq!(episodes.total, 101, "the total counts the restricted one");
         assert_eq!(episodes.items.len(), 1, "a restricted episode is left out");
         assert_eq!(episodes.items[0].show.as_ref().unwrap().name, "The Gobcast");
+    }
+
+    #[test]
+    fn personal_mixes_among_the_top_results_lead_the_playlists() {
+        let mix = |uri: &str, name: &str| json!({"item": {"data": {
+            "__typename": "Playlist", "uri": uri, "name": name,
+            "ownerV2": {"data": {"name": "Spotify", "username": "spotify"}}
+        }}});
+        let only_top = json!({
+            "playlists": {"totalCount": 0, "items": []},
+            "topResultsV2": {"itemsV2": [
+                mix("spotify:playlist:37i9dQZF1EVHGWrwldPRtj", "Chill Mix"),
+                {"item": {"data": {"__typename": "Track", "uri": "spotify:track:t"}}}
+            ]}
+        });
+        let playlists = results_of(&only_top).playlists.unwrap();
+        assert_eq!(playlists.items.len(), 1);
+        assert_eq!(playlists.items[0].name, "Chill Mix");
+        assert_eq!(playlists.total, 1);
+
+        let mut both = answer();
+        both["topResultsV2"] = json!({"itemsV2": [
+            mix("spotify:playlist:top", "Chill Mix"),
+            mix("spotify:playlist:37i9dQZF1EIWLH4VTcMWk5", "Mix")
+        ]});
+        let playlists = results_of(&both).playlists.unwrap();
+        let uris: Vec<&str> = playlists.items.iter().map(|p| p.uri.as_str()).collect();
+        assert_eq!(uris, ["spotify:playlist:top", "spotify:playlist:37i9dQZF1EIWLH4VTcMWk5"]);
+        assert_eq!(playlists.total, 201);
     }
 
     #[test]
