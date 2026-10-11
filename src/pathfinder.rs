@@ -121,6 +121,11 @@ fn playlist_page(data: &Value, offset: u32, limit: u32) -> Result<Page<Playlist>
     let library = data
         .pointer("/me/libraryV3")
         .ok_or_else(|| Failure::Retry(anyhow::anyhow!("library answered no playlists")))?;
+    let kind = library["__typename"].as_str().unwrap_or_default();
+    // A refusal is no empty library: the Web API answers instead.
+    if kind.ends_with("Error") {
+        return Err(Failure::Retry(anyhow::anyhow!("library refused: {library}")));
+    }
     let entries = library["items"].as_array().map_or(&[][..], Vec::as_slice);
     // Liked songs and episodes ride along as pseudo playlists; the page's
     // own paging counts them, so the next offset still lines up.
@@ -128,6 +133,17 @@ fn playlist_page(data: &Value, offset: u32, limit: u32) -> Result<Page<Playlist>
         .iter()
         .filter_map(|entry| playlist(&entry["item"]["data"]))
         .collect();
+    let skipped: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["item"]["data"]["__typename"].as_str().unwrap_or("?"))
+        .filter(|kind| *kind != "Playlist")
+        .collect();
+    log::debug!(
+        "library page at {offset}: {kind}, {} entries, {} playlists, skipped {skipped:?}, total {}",
+        entries.len(),
+        items.len(),
+        library["totalCount"]
+    );
     let seen = offset.saturating_add(entries.len() as u32);
     let total = library["totalCount"]
         .as_u64()
@@ -1105,6 +1121,8 @@ mod tests {
         assert_eq!(list.description, None);
         assert!(list.images[0].url.starts_with("https://mosaic.scdn.co/"));
         assert!(playlist_page(&json!({}), 0, 50).is_err());
+        let refused = json!({"me": {"libraryV3": {"__typename": "LibraryInternalError"}}});
+        assert!(playlist_page(&refused, 0, 50).is_err(), "a refusal is no empty library");
     }
 
     #[test]
