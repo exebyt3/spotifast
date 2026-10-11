@@ -1,0 +1,66 @@
+name: Fork release (Windows)
+
+# The fork's releases: the Linux build comes from a Fedora machine, this
+# adds the Windows x64 zip and installer to the release named by `tag`.
+# release.yml stays upstream's: it needs signing keys this fork does not have.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to attach the Windows build to
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      TARGET: x86_64-pc-windows-msvc
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: rustup target add x86_64-pc-windows-msvc
+      - name: GLEW for libprojectM
+        run: vcpkg install glew:x64-windows-static
+      - name: MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package
+        shell: bash
+        run: |
+          name="spotifast-${TAG}-windows-x64"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/spotifast.exe" README.md LICENSE \
+            packaging/spotifast-portable.txt "dist/$name/"
+          cd dist && 7z a "$name.zip" "$name"
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & $iscc "/DVersion=$version" "/DArch=x86_64" `
+            "/DBinary=$PWD\target\$env:TARGET\release\spotifast.exe" `
+            "/DOutputDir=$PWD\dist" packaging\windows\spotifast.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/*.zip dist/*-setup.exe --clobber --repo "$GITHUB_REPOSITORY"
