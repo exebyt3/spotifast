@@ -3872,6 +3872,21 @@ async fn handle(
             }
         }
     };
+    if let (Some(engine), ApiResponse::PlaybackState { result: Ok(state), .. }) =
+        (engine, &response)
+    {
+        // The pushed state is held against what the Web API says: it
+        // stays believed if they agree and is dropped if they do not.
+        let device = state
+            .as_ref()
+            .and_then(|state| state.device.as_ref())
+            .and_then(|device| device.id.as_deref());
+        let song = state
+            .as_ref()
+            .and_then(|state| state.item.as_ref())
+            .map(PlayableItem::uri);
+        engine.cluster().check(device, song);
+    }
     observe_playlists(api, &response);
     (response, expired.get())
 }
@@ -3886,6 +3901,10 @@ fn same_account(username: &str, account: Option<&AccountId>) -> bool {
 /// How many releases a page of an artist's discography holds.
 const ARTIST_ALBUMS_PAGE_SIZE: u32 = 50;
 
+/// How many songs a page of an album holds.
+const ALBUM_TRACKS_PAGE_SIZE: u32 = 50;
+/// How many episodes a page of a show holds.
+const SHOW_EPISODES_PAGE_SIZE: u32 = 50;
 /// How many liked songs a page of the library holds.
 const SAVED_PAGE_SIZE: u32 = 50;
 /// How many playlists a page of the library list holds.
@@ -3958,9 +3977,98 @@ async fn over_session(
             SessionRead::SetSaved { uris, saved } => SessionAnswer::Changed(settle(
                 crate::pathfinder::set_saved(session, http, uris, saved).await,
             )?),
+            SessionRead::SavedAlbums { offset } => SessionAnswer::SavedAlbums(settle(
+                crate::pathfinder::saved_albums(session, http, offset, SAVED_PAGE_SIZE).await,
+            )?),
+            SessionRead::SavedShows { offset } => SessionAnswer::SavedShows(settle(
+                crate::pathfinder::saved_shows(session, http, offset, SAVED_PAGE_SIZE).await,
+            )?),
+            SessionRead::FollowedArtists => SessionAnswer::Followed(settle(
+                crate::pathfinder::followed_artists(session, http).await,
+            )?),
+            SessionRead::Album { id } => {
+                SessionAnswer::Album(settle(session_reads::album_by_id(session, id).await)?)
+            }
+            SessionRead::AlbumTracks { id, offset } => SessionAnswer::AlbumTracks(settle(
+                session_reads::album_tracks(session, id, offset, ALBUM_TRACKS_PAGE_SIZE).await,
+            )?),
+            SessionRead::Track { id } => {
+                SessionAnswer::Track(settle(session_reads::track_by_id(session, id).await)?)
+            }
+            SessionRead::Episode { id } => {
+                SessionAnswer::Episode(settle(session_reads::episode_by_id(session, id).await)?)
+            }
+            SessionRead::Show { id } => {
+                SessionAnswer::Show(settle(session_reads::show(session, id).await)?)
+            }
+            SessionRead::ShowEpisodes { id, offset } => SessionAnswer::Episodes(settle(
+                crate::pathfinder::show_episodes(session, http, id, offset, SHOW_EPISODES_PAGE_SIZE)
+                    .await,
+            )?),
+            SessionRead::HomeEpisodes { shows } => {
+                let mut found = Vec::new();
+                for show in shows {
+                    let page = crate::pathfinder::show_episodes(
+                        session,
+                        http,
+                        &show.id,
+                        0,
+                        HOME_EPISODES_PER_SHOW,
+                    )
+                    .await;
+                    // A show that is gone answers on its own, as it does
+                    // from the Web API; a dropped line is the Web API's.
+                    if let Ok(page) = settle(page)? {
+                        found.push((show.clone(), page.items));
+                    }
+                }
+                if found.is_empty() {
+                    return None;
+                }
+                SessionAnswer::HomeEpisodes(Ok(found))
+            }
+            SessionRead::Duplicates { id, uris } => SessionAnswer::Duplicates(settle(
+                session_reads::duplicates(session, id, &uris).await,
+            )?),
+            SessionRead::Devices => {
+                let cluster = engine.cluster().fresh()?;
+                SessionAnswer::Devices(Ok(crate::connect_state::devices(&cluster)))
+            }
+            SessionRead::PlaybackState => {
+                let cluster = engine.cluster().fresh()?;
+                SessionAnswer::Playback(settle(
+                    crate::connect_state::playback(session, engine.cluster(), &cluster).await,
+                )?)
+            }
+            SessionRead::Queue => {
+                let cluster = engine.cluster().fresh()?;
+                SessionAnswer::Queue(settle(
+                    crate::connect_state::upcoming_queue(session, engine.cluster(), &cluster)
+                        .await,
+                )?)
+            }
+            SessionRead::Command { target, command } => SessionAnswer::Command(settle(
+                crate::connect_state::send(
+                    session,
+                    engine.cluster(),
+                    engine.device_id(),
+                    target,
+                    command,
+                )
+                .await,
+            )?),
         })
     };
+    let command = matches!(session_read(request), Some(SessionRead::Command { .. }));
     let Ok(answer) = tokio::time::timeout(SESSION_READ_TIMEOUT, read).await else {
+        if command {
+            // It may have gone out; asking the Web API too could send it twice.
+            let unconfirmed = SessionAnswer::Command(Err(ApiError::Status {
+                status: 504,
+                message: "Spotify did not confirm the command".into(),
+            }));
+            return session_response(request, unconfirmed, account_id);
+        }
         log::debug!("session read timed out; asking the Web API");
         return None;
     };
@@ -3990,6 +4098,28 @@ enum SessionRead<'a> {
     SavedTracks { offset: u32 },
     Contains { uris: &'a [String] },
     SetSaved { uris: &'a [String], saved: bool },
+    SavedAlbums { offset: u32 },
+    SavedShows { offset: u32 },
+    /// Every followed artist at once; a page continuing one the Web API
+    /// began is the Web API's.
+    FollowedArtists,
+    Album { id: &'a str },
+    AlbumTracks { id: &'a str, offset: u32 },
+    Track { id: &'a str },
+    Episode { id: &'a str },
+    Show { id: &'a str },
+    ShowEpisodes { id: &'a str, offset: u32 },
+    HomeEpisodes { shows: &'a [Show] },
+    Duplicates { id: &'a str, uris: Vec<String> },
+    Devices,
+    PlaybackState,
+    Queue,
+    /// A command to one of the account's devices; the active one when
+    /// there is no target.
+    Command {
+        target: Option<&'a str>,
+        command: crate::connect_state::Command<'a>,
+    },
 }
 
 fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
@@ -4027,6 +4157,63 @@ fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
                 saved: *saved,
             }
         }
+        ApiRequest::SavedAlbums { offset } => SessionRead::SavedAlbums { offset: *offset },
+        ApiRequest::SavedShows { offset } => SessionRead::SavedShows { offset: *offset },
+        ApiRequest::FollowedArtists { after: None } => SessionRead::FollowedArtists,
+        ApiRequest::Album { id } => SessionRead::Album { id },
+        ApiRequest::AlbumTracks { id, offset, .. }
+        | ApiRequest::AlbumQueueTracks { id, offset, .. } => {
+            SessionRead::AlbumTracks { id, offset: *offset }
+        }
+        ApiRequest::Track { id } => SessionRead::Track { id },
+        ApiRequest::Episode { id } => SessionRead::Episode { id },
+        ApiRequest::Show { id } => SessionRead::Show { id },
+        ApiRequest::ShowEpisodes { id, offset } => SessionRead::ShowEpisodes { id, offset: *offset },
+        ApiRequest::HomeEpisodes { shows, .. } => SessionRead::HomeEpisodes { shows },
+        ApiRequest::CheckPlaylistDuplicates {
+            playlist_id, items, ..
+        } => SessionRead::Duplicates {
+            id: playlist_id,
+            uris: items.iter().map(|item| item.uri().to_string()).collect(),
+        },
+        ApiRequest::Devices => SessionRead::Devices,
+        ApiRequest::PlaybackState { .. } => SessionRead::PlaybackState,
+        ApiRequest::Queue { .. } => SessionRead::Queue,
+        ApiRequest::Remote {
+            action,
+            device_id,
+            play,
+            position_ms,
+            percent,
+            flag,
+            repeat,
+        } => {
+            use crate::connect_state::Command;
+            let command = match action {
+                // A play that names what to play is the Web API's.
+                RemoteAction::Play if play.is_none() => Command::Resume,
+                RemoteAction::Play => return None,
+                RemoteAction::Pause => Command::Pause,
+                RemoteAction::Next => Command::Next,
+                RemoteAction::Previous => Command::Previous,
+                RemoteAction::Seek => Command::Seek(*position_ms),
+                RemoteAction::Volume => Command::Volume(*percent),
+                RemoteAction::Shuffle => Command::Shuffle(*flag),
+                RemoteAction::Repeat => Command::Repeat(repeat),
+            };
+            SessionRead::Command {
+                target: device_id.as_deref(),
+                command,
+            }
+        }
+        ApiRequest::Transfer { device_id, play } => SessionRead::Command {
+            target: Some(device_id),
+            command: crate::connect_state::Command::Transfer { play: *play },
+        },
+        ApiRequest::AddToQueue { uri, device_id, .. } => SessionRead::Command {
+            target: device_id.as_deref(),
+            command: crate::connect_state::Command::Queue(uri),
+        },
         _ => return None,
     })
 }
@@ -4045,6 +4232,21 @@ enum SessionAnswer {
     Saved(ApiResult<Page<SavedTrack>>),
     Flags(ApiResult<Vec<bool>>),
     Changed(ApiResult<()>),
+    SavedAlbums(ApiResult<Page<SavedAlbum>>),
+    SavedShows(ApiResult<Page<SavedShow>>),
+    Followed(ApiResult<CursorPage<Artist>>),
+    Album(ApiResult<Album>),
+    AlbumTracks(ApiResult<Page<Track>>),
+    Track(ApiResult<Track>),
+    Episode(ApiResult<Episode>),
+    Show(ApiResult<Show>),
+    Episodes(ApiResult<Page<Episode>>),
+    HomeEpisodes(ApiResult<Vec<(Show, Vec<Episode>)>>),
+    Duplicates(ApiResult<Vec<String>>),
+    Devices(ApiResult<Vec<Device>>),
+    Playback(ApiResult<Option<PlaybackState>>),
+    Queue(ApiResult<Queue>),
+    Command(ApiResult<()>),
 }
 
 /// The response a session answer becomes, carrying the request's own id,
@@ -4159,6 +4361,120 @@ fn session_response(
                 result,
             }
         }
+        (ApiRequest::SavedAlbums { offset }, SessionAnswer::SavedAlbums(result)) => {
+            ApiResponse::SavedAlbums {
+                offset: *offset,
+                result,
+            }
+        }
+        (ApiRequest::SavedShows { offset }, SessionAnswer::SavedShows(result)) => {
+            ApiResponse::SavedShows {
+                offset: *offset,
+                result,
+            }
+        }
+        (ApiRequest::FollowedArtists { after }, SessionAnswer::Followed(result)) => {
+            ApiResponse::FollowedArtists {
+                after: after.clone(),
+                result,
+            }
+        }
+        (ApiRequest::Album { id }, SessionAnswer::Album(result)) => ApiResponse::Album {
+            id: id.clone(),
+            result,
+        },
+        (
+            ApiRequest::AlbumTracks {
+                id,
+                offset,
+                generation,
+            },
+            SessionAnswer::AlbumTracks(result),
+        ) => ApiResponse::AlbumTracks {
+            id: id.clone(),
+            offset: *offset,
+            generation: *generation,
+            result,
+        },
+        (
+            ApiRequest::AlbumQueueTracks {
+                offset, request, ..
+            },
+            SessionAnswer::AlbumTracks(result),
+        ) => ApiResponse::AlbumQueueTracks {
+            offset: *offset,
+            request: *request,
+            result,
+        },
+        (ApiRequest::Track { id }, SessionAnswer::Track(result)) => ApiResponse::Track {
+            id: id.clone(),
+            result,
+        },
+        (ApiRequest::Episode { id }, SessionAnswer::Episode(result)) => ApiResponse::Episode {
+            id: id.clone(),
+            result,
+        },
+        (ApiRequest::Show { id }, SessionAnswer::Show(result)) => ApiResponse::Show {
+            id: id.clone(),
+            result,
+        },
+        (ApiRequest::ShowEpisodes { id, offset }, SessionAnswer::Episodes(result)) => {
+            ApiResponse::ShowEpisodes {
+                id: id.clone(),
+                offset: *offset,
+                result,
+            }
+        }
+        (ApiRequest::HomeEpisodes { generation, .. }, SessionAnswer::HomeEpisodes(result)) => {
+            ApiResponse::HomeEpisodes {
+                generation: *generation,
+                result,
+            }
+        }
+        (ApiRequest::Devices, SessionAnswer::Devices(result)) => ApiResponse::Devices(result),
+        (ApiRequest::PlaybackState { seq }, SessionAnswer::Playback(result)) => {
+            ApiResponse::PlaybackState {
+                seq: *seq,
+                result,
+            }
+        }
+        (ApiRequest::Queue { seq }, SessionAnswer::Queue(result)) => ApiResponse::Queue {
+            seq: *seq,
+            result,
+        },
+        (ApiRequest::Remote { action, .. }, SessionAnswer::Command(result)) => {
+            ApiResponse::Remote {
+                action: *action,
+                result,
+            }
+        }
+        (ApiRequest::Transfer { device_id, .. }, SessionAnswer::Command(result)) => {
+            ApiResponse::Transferred {
+                result,
+                device_id: device_id.clone(),
+            }
+        }
+        (ApiRequest::AddToQueue { label, .. }, SessionAnswer::Command(result)) => {
+            ApiResponse::QueueAdded {
+                result,
+                label: label.clone(),
+            }
+        }
+        (
+            ApiRequest::CheckPlaylistDuplicates {
+                playlist_id,
+                playlist_name,
+                items,
+                position,
+            },
+            SessionAnswer::Duplicates(result),
+        ) => ApiResponse::PlaylistDuplicatesChecked {
+            result,
+            playlist_id: playlist_id.clone(),
+            playlist_name: playlist_name.clone(),
+            items: items.clone(),
+            position: *position,
+        },
         _ => return None,
     })
 }
@@ -6273,7 +6589,13 @@ mod session_tests {
             items: Vec::new(),
             position: None,
         };
-        assert_eq!(session_read(&duplicates), None);
+        assert_eq!(
+            session_read(&duplicates),
+            Some(SessionRead::Duplicates {
+                id: "pl1",
+                uris: Vec::new()
+            })
+        );
         assert_eq!(session_read(&ApiRequest::Me), None);
 
         let songs = vec!["spotify:track:1nBxszQgD8kHACCWMFEm5Z".to_string()];
@@ -6306,6 +6628,94 @@ mod session_tests {
                 saved: false
             }),
             None
+        );
+    }
+
+    #[test]
+    fn the_catalogue_library_and_playback_ask_the_session() {
+        use crate::connect_state::Command;
+        assert_eq!(
+            session_read(&ApiRequest::Album { id: "a".into() }),
+            Some(SessionRead::Album { id: "a" })
+        );
+        let queue_page = ApiRequest::AlbumQueueTracks {
+            id: "a".into(),
+            offset: 50,
+            request: 3,
+        };
+        assert_eq!(
+            session_read(&queue_page),
+            Some(SessionRead::AlbumTracks { id: "a", offset: 50 })
+        );
+        assert_eq!(
+            session_read(&ApiRequest::ShowEpisodes {
+                id: "s".into(),
+                offset: 0
+            }),
+            Some(SessionRead::ShowEpisodes { id: "s", offset: 0 })
+        );
+        assert_eq!(
+            session_read(&ApiRequest::FollowedArtists { after: None }),
+            Some(SessionRead::FollowedArtists)
+        );
+        assert_eq!(
+            session_read(&ApiRequest::FollowedArtists {
+                after: Some("x".into())
+            }),
+            None,
+            "a page the Web API began is the Web API's to continue"
+        );
+        assert_eq!(session_read(&ApiRequest::Devices), Some(SessionRead::Devices));
+        assert_eq!(
+            session_read(&ApiRequest::PlaybackState { seq: 1 }),
+            Some(SessionRead::PlaybackState)
+        );
+        assert_eq!(session_read(&ApiRequest::Queue { seq: 1 }), Some(SessionRead::Queue));
+
+        let remote = |action, play| ApiRequest::Remote {
+            action,
+            device_id: Some("pc".into()),
+            play,
+            position_ms: 1500,
+            percent: 40,
+            flag: true,
+            repeat: "track".into(),
+        };
+        assert_eq!(
+            session_read(&remote(RemoteAction::Play, None)),
+            Some(SessionRead::Command {
+                target: Some("pc"),
+                command: Command::Resume
+            })
+        );
+        assert_eq!(
+            session_read(&remote(RemoteAction::Play, Some(PlayRequest::default()))),
+            None,
+            "a play that names what to play is the Web API's"
+        );
+        assert_eq!(
+            session_read(&remote(RemoteAction::Seek, None)),
+            Some(SessionRead::Command {
+                target: Some("pc"),
+                command: Command::Seek(1500)
+            })
+        );
+        assert_eq!(
+            session_read(&remote(RemoteAction::Repeat, None)),
+            Some(SessionRead::Command {
+                target: Some("pc"),
+                command: Command::Repeat("track")
+            })
+        );
+        assert_eq!(
+            session_read(&ApiRequest::Transfer {
+                device_id: "pc".into(),
+                play: false
+            }),
+            Some(SessionRead::Command {
+                target: Some("pc"),
+                command: Command::Transfer { play: false }
+            })
         );
     }
 

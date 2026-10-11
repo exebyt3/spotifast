@@ -104,13 +104,16 @@ pub enum Operation {
 /// playlists, which it reads quickly and with every field. Catalogue reads
 /// it serves whichever app would have taken them, searches, the playlist
 /// list and the liked songs among them: it has no quota at all, and it reads what a personal
-/// app is refused.
+/// app is refused. The account's devices, playback and queue are what
+/// Spotify pushes to it, and the commands to the account's other devices
+/// go out over the same channel.
 fn session_serves(operation: Operation, personal_ready: bool) -> bool {
     match operation {
         Operation::PlaylistMetadata(_) | Operation::PlaylistItems(_) => {
             plan(operation, personal_ready) == ApiSource::Shared
         }
-        Operation::Catalog
+        Operation::Playback
+        | Operation::Catalog
         | Operation::CatalogSearch
         | Operation::PlaylistLibrary
         | Operation::PlaylistSearch
@@ -432,6 +435,8 @@ mod tests {
     fn the_session_reads_what_the_shared_app_would_have() {
         for (operation, personal) in [
             (Operation::PlaylistItems(PlaylistAccess::External), true),
+            (Operation::Playback, true),
+            (Operation::Playback, false),
             (Operation::Catalog, true),
             (Operation::Catalog, false),
             (Operation::CatalogSearch, true),

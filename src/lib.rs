@@ -8,6 +8,7 @@ pub mod auth;
 pub mod autoscroll;
 pub mod backend;
 pub mod bidi;
+pub mod connect_state;
 pub mod credentials;
 #[cfg(any(test, feature = "demo"))]
 pub mod demo;

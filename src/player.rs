@@ -307,6 +307,39 @@ pub enum EngineEvent {
 
 pub type Notify = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 
+/// Keeps `view` current with the Connect state Spotify pushes to the
+/// session. Spirc listens to the same stream; the dealer hands each
+/// listener its own copy.
+fn follow_cluster(session: &Session, view: &Arc<crate::connect_state::ClusterView>) {
+    use futures_util::StreamExt as _;
+    use librespot_core::dealer::protocol::Message;
+    use librespot_protocol::connect::ClusterUpdate;
+
+    let mut updates = match session
+        .dealer()
+        .listen_for("hm://connect-state/v1/cluster", Message::from_raw::<ClusterUpdate>)
+    {
+        Ok(updates) => updates,
+        Err(error) => {
+            log::debug!("cluster updates unavailable: {error}");
+            return;
+        }
+    };
+    let view = Arc::clone(view);
+    tokio::spawn(async move {
+        while let Some(update) = updates.next().await {
+            match update {
+                Ok(update) => {
+                    if let Some(cluster) = update.cluster.into_option() {
+                        view.update(cluster);
+                    }
+                }
+                Err(error) => log::debug!("cluster update unreadable: {error}"),
+            }
+        }
+    });
+}
+
 pub struct Engine {
     player: Arc<Player>,
     spirc: Arc<Spirc>,
@@ -318,6 +351,8 @@ pub struct Engine {
     interrupted: Arc<Mutex<Option<Interrupted>>>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
     audio: Arc<AudioControl>,
+    /// The account's devices and playback as Spotify pushes them.
+    cluster: Arc<crate::connect_state::ClusterView>,
 }
 
 impl Engine {
@@ -413,6 +448,9 @@ impl Engine {
             notify(EngineEvent::State(current.clone()));
         }
 
+        let cluster: Arc<crate::connect_state::ClusterView> = Arc::default();
+        follow_cluster(&session, &cluster);
+
         let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let interrupted: Arc<Mutex<Option<Interrupted>>> = Arc::default();
         let ended_flag = Arc::clone(&shutting_down);
@@ -447,7 +485,13 @@ impl Engine {
             interrupted,
             shutting_down,
             audio,
+            cluster,
         })
+    }
+
+    /// The account's devices and playback, as last pushed to this session.
+    pub fn cluster(&self) -> &Arc<crate::connect_state::ClusterView> {
+        &self.cluster
     }
 
     /// Playback state to resume after replacing this engine.

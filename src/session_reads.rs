@@ -9,24 +9,28 @@ use base64::Engine as _;
 use librespot_core::{FileId, Session, SpotifyUri, error::ErrorKind, spotify_id::SpotifyId};
 use librespot_metadata::album::AlbumType;
 use librespot_metadata::artist::Artist as SessionArtist;
+use librespot_metadata::copyright::CopyrightType;
 use librespot_metadata::image::Images;
 use librespot_metadata::playlist::attribute::PlaylistAttributes;
 use librespot_metadata::playlist::item::PlaylistItem as SessionRow;
 use librespot_metadata::{
     Album as SessionAlbum, Episode as SessionEpisode, Playlist as SessionPlaylist,
-    Track as SessionTrack,
+    Show as SessionShow, Track as SessionTrack,
 };
 use librespot_protocol::extended_metadata::{
     BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery,
 };
 use librespot_protocol::extension_kind::ExtensionKind;
-use librespot_protocol::metadata::{Album as AlbumMessage, Artist as ArtistMessage};
+use librespot_protocol::metadata::{
+    Album as AlbumMessage, Artist as ArtistMessage, Episode as EpisodeMessage,
+    Show as ShowMessage, Track as TrackMessage,
+};
 use protobuf::{EnumOrUnknown, Message as _};
 
 use crate::api::ApiError;
 use crate::api::models::{
-    Album, Artist, ArtistRef, Episode, Image, Owner, Page, PlayableItem, Playlist, PlaylistItem, Show,
-    Track, TrackCount, UserRef,
+    Album, Artist, ArtistRef, Copyright, Episode, ExternalIds, Image, Owner, Page, PlayableItem,
+    Playlist, PlaylistItem, Show, Track, TrackCount, UserRef,
 };
 
 const IMAGE_HOST: &str = "https://i.scdn.co/image/";
@@ -276,6 +280,164 @@ pub async fn related_artists(session: &Session, id: &str) -> Result<Vec<Artist>,
         .collect())
 }
 
+/// An album's header. The songs come page by page from [`album_tracks`], as
+/// they do from the Web API.
+pub async fn album_by_id(session: &Session, id: &str) -> Result<Album, Failure> {
+    let message = album_message(session, id).await?;
+    album_model(&message)
+        .ok_or_else(|| Failure::Retry(anyhow::anyhow!("unreadable metadata for album {id}")))
+}
+
+/// One page of the album's songs in disc and track order, with their
+/// details from one batched request. A song Spotify has no details for
+/// would leave a hole in the numbering, so the Web API is asked instead.
+pub async fn album_tracks(
+    session: &Session,
+    id: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<Page<Track>, Failure> {
+    let parsed = SessionAlbum::try_from(&album_message(session, id).await?)?;
+    let uris: Vec<&SpotifyUri> = parsed.tracks().collect();
+    let total = uris.len();
+    let start = (offset as usize).min(total);
+    let end = start.saturating_add(limit as usize).min(total);
+    let window = &uris[start..end];
+    let found = metadata(session, window.iter().copied()).await?;
+    let mut items = Vec::with_capacity(window.len());
+    for uri in window {
+        let song = uri.to_uri().ok().and_then(|text| match found.get(&text) {
+            Some(PlayableItem::Track(track)) => Some(track.clone()),
+            _ => None,
+        });
+        // The Web API's album songs carry no album of their own.
+        items.push(song.map(|track| Track { album: None, ..track }).ok_or_else(|| {
+            Failure::Retry(anyhow::anyhow!("no details for a song of album {id}"))
+        })?);
+    }
+    Ok(Page {
+        items,
+        total: u32::try_from(total).unwrap_or(u32::MAX),
+        limit,
+        offset,
+        next: (end < total).then(String::new),
+    })
+}
+
+/// One song, as the Web API's track gives it.
+pub async fn track_by_id(session: &Session, id: &str) -> Result<Track, Failure> {
+    let uri = SpotifyUri::Track {
+        id: SpotifyId::from_base62(id)?,
+    };
+    let bytes = session
+        .spclient()
+        .get_track_metadata(&uri)
+        .await
+        .map_err(refused)?;
+    let message =
+        TrackMessage::parse_from_bytes(&bytes).map_err(|error| Failure::Retry(error.into()))?;
+    Ok(track(SessionTrack::try_from(&message)?))
+}
+
+/// One episode, with the show it belongs to.
+pub async fn episode_by_id(session: &Session, id: &str) -> Result<Episode, Failure> {
+    let uri = SpotifyUri::Episode {
+        id: SpotifyId::from_base62(id)?,
+    };
+    let bytes = session
+        .spclient()
+        .get_episode_metadata(&uri)
+        .await
+        .map_err(refused)?;
+    let message =
+        EpisodeMessage::parse_from_bytes(&bytes).map_err(|error| Failure::Retry(error.into()))?;
+    let show_id = SpotifyId::from_raw(message.show.gid())
+        .ok()
+        .and_then(|id| id.to_base62().ok());
+    Ok(episode(SessionEpisode::try_from(&message)?, show_id))
+}
+
+/// A show's header: name, publisher, description, cover, and how many
+/// episodes it has. An audiobook is the Web API's, which tells it apart.
+pub async fn show(session: &Session, id: &str) -> Result<Show, Failure> {
+    let uri = SpotifyUri::Show {
+        id: SpotifyId::from_base62(id)?,
+    };
+    let bytes = session
+        .spclient()
+        .get_show_metadata(&uri)
+        .await
+        .map_err(refused)?;
+    let message =
+        ShowMessage::parse_from_bytes(&bytes).map_err(|error| Failure::Retry(error.into()))?;
+    let parsed = SessionShow::try_from(&message)?;
+    if parsed.is_audiobook {
+        return Err(Failure::Retry(anyhow::anyhow!("{id} is an audiobook")));
+    }
+    Ok(Show {
+        id: parsed.id.to_id().unwrap_or_default(),
+        uri: parsed.id.to_uri().unwrap_or_default(),
+        name: parsed.name.clone(),
+        publisher: parsed.publisher.clone(),
+        description: parsed.description.clone(),
+        images: images(&parsed.covers),
+        total_episodes: u32::try_from(parsed.episodes.len()).ok(),
+        ..Default::default()
+    })
+}
+
+/// How many rows one request asks of a playlist while looking for songs.
+const DUPLICATE_WINDOW: u32 = 100;
+
+/// Which of `uris` the playlist already holds, in the order asked. Only
+/// the rows' own URIs are read, so no song details are asked for.
+pub async fn duplicates(
+    session: &Session,
+    id: &str,
+    uris: &[String],
+) -> Result<Vec<String>, Failure> {
+    let wanted: BTreeSet<&str> = uris.iter().map(String::as_str).collect();
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut found = BTreeSet::new();
+    let mut offset = 0u32;
+    loop {
+        let list = window(session, id, offset, DUPLICATE_WINDOW).await?;
+        let rows = rows(&list, offset, DUPLICATE_WINDOW);
+        let total = total(&list);
+        complete(rows.len(), offset, DUPLICATE_WINDOW, total)?;
+        for row in rows {
+            if let Ok(uri) = row.id.to_uri()
+                && wanted.contains(uri.as_str())
+            {
+                found.insert(uri);
+            }
+        }
+        offset = offset.saturating_add(rows.len() as u32);
+        if found.len() == wanted.len() || rows.is_empty() || offset >= total {
+            break;
+        }
+    }
+    Ok(uris
+        .iter()
+        .filter(|uri| found.contains(uri.as_str()))
+        .cloned()
+        .collect())
+}
+
+async fn album_message(session: &Session, id: &str) -> Result<AlbumMessage, Failure> {
+    let uri = SpotifyUri::Album {
+        id: SpotifyId::from_base62(id)?,
+    };
+    let bytes = session
+        .spclient()
+        .get_album_metadata(&uri)
+        .await
+        .map_err(refused)?;
+    AlbumMessage::parse_from_bytes(&bytes).map_err(|error| Failure::Retry(error.into()))
+}
+
 async fn artist_message(session: &Session, id: &str) -> Result<ArtistMessage, Failure> {
     let uri = SpotifyUri::Artist {
         id: SpotifyId::from_base62(id)?,
@@ -311,7 +473,15 @@ fn artist_model(message: &ArtistMessage) -> Result<Artist, Failure> {
 /// bytes are not an album.
 fn release(group: &str, bytes: &[u8]) -> Option<Album> {
     let message = AlbumMessage::parse_from_bytes(bytes).ok()?;
-    let parsed = SessionAlbum::try_from(&message).ok()?;
+    let mut release = album_model(&message)?;
+    release.album_group = Some(group.to_string());
+    Some(release)
+}
+
+/// An album as the Web API gives it, without its songs: the type, how many
+/// songs, the date, the copyright lines, and the popularity.
+fn album_model(message: &AlbumMessage) -> Option<Album> {
+    let parsed = SessionAlbum::try_from(message).ok()?;
     // The Web API files an EP under singles.
     let kind = match parsed.album_type {
         AlbumType::SINGLE | AlbumType::EP => "single",
@@ -319,11 +489,21 @@ fn release(group: &str, bytes: &[u8]) -> Option<Album> {
         _ => "album",
     };
     let tracks = u32::try_from(parsed.tracks().count()).unwrap_or(u32::MAX);
+    let copyrights = parsed
+        .copyrights
+        .iter()
+        .map(|line| Copyright {
+            text: line.text.clone(),
+            kind: if line.copyright_type == CopyrightType::P { "P" } else { "C" }.to_string(),
+        })
+        .collect();
+    let popularity = Some(parsed.popularity.clamp(0, 100) as u8);
     let mut release = album(parsed);
     release.album_type = Some(kind.to_string());
-    release.album_group = Some(group.to_string());
     release.total_tracks = Some(tracks);
-    release.release_date = release_date(&message);
+    release.release_date = release_date(message);
+    release.copyrights = copyrights;
+    release.popularity = popularity;
     Some(release)
 }
 
@@ -667,6 +847,16 @@ async fn metadata(
     answers(&asked, response)
 }
 
+/// The details of every song and episode among `uris`, by URI, as the
+/// playback state and the queue show them. One Spotify has none for is
+/// absent.
+pub async fn playables(
+    session: &Session,
+    uris: &[SpotifyUri],
+) -> Result<HashMap<String, PlayableItem>, Failure> {
+    metadata(session, uris.iter()).await
+}
+
 /// One request for the details of every track and episode among `uris`,
 /// with the URIs it asks for. A playlist can hold the same song twice; it
 /// is asked for once.
@@ -780,6 +970,13 @@ fn track(track: SessionTrack) -> Track {
         track_number: Some(u32::try_from(track.number).unwrap_or_default()),
         disc_number: Some(u32::try_from(track.disc_number).unwrap_or_default()),
         popularity: Some(track.popularity.clamp(0, 100) as u8),
+        external_ids: ExternalIds {
+            isrc: track
+                .external_ids
+                .iter()
+                .find(|external| external.external_type.eq_ignore_ascii_case("isrc"))
+                .map(|external| external.id.clone()),
+        },
         ..Default::default()
     }
 }
@@ -1587,5 +1784,50 @@ mod tests {
                 "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
             ]
         );
+    }
+
+    #[test]
+    fn an_album_reads_with_its_type_copyrights_and_song_count() {
+        use librespot_protocol::metadata::{Copyright as CopyrightMessage, Disc, copyright};
+        let mut message = AlbumMessage::new();
+        message.set_gid(vec![9; 16]);
+        message.set_name("Nine".into());
+        message.set_popularity(130);
+        message.set_type(librespot_protocol::metadata::album::Type::EP);
+        message.date.mut_or_insert_default().set_year(2022);
+        let mut line = CopyrightMessage::new();
+        line.set_type(copyright::Type::P);
+        line.set_text("2022 Label".into());
+        message.copyright.push(line);
+        let mut disc = Disc::new();
+        disc.set_number(1);
+        let mut song = librespot_protocol::metadata::Track::new();
+        song.set_gid(GID.to_vec());
+        disc.track.push(song);
+        message.disc.push(disc);
+
+        let album = album_model(&message).unwrap();
+        assert_eq!(album.album_type.as_deref(), Some("single"), "an EP is a single");
+        assert_eq!(album.total_tracks, Some(1));
+        assert_eq!(album.popularity, Some(100));
+        assert_eq!(album.release_date.as_deref(), Some("2022"));
+        assert_eq!(album.copyrights.len(), 1);
+        assert_eq!(album.copyrights[0].kind, "P");
+        assert_eq!(album.copyrights[0].text, "2022 Label");
+        assert!(album.tracks.is_none(), "the songs come page by page");
+    }
+
+    #[test]
+    fn a_track_carries_its_isrc() {
+        let mut message = librespot_protocol::metadata::Track::new();
+        message.set_gid(GID.to_vec());
+        message.set_name("Song".into());
+        message.album.mut_or_insert_default().set_gid(vec![0x03; 16]);
+        let mut isrc = librespot_protocol::metadata::ExternalId::new();
+        isrc.set_type("isrc".into());
+        isrc.set_id("GBAYE0000001".into());
+        message.external_id.push(isrc);
+        let track = track(SessionTrack::try_from(&message).unwrap());
+        assert_eq!(track.external_ids.isrc.as_deref(), Some("GBAYE0000001"));
     }
 }

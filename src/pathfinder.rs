@@ -1,7 +1,8 @@
-//! Search, the playlist list and the liked songs over the web player's
-//! GraphQL endpoint, with the streaming session's own token. Spotify's clients ask
-//! there, and it has no per-app quota, so neither waits on the shared app's
-//! rate limit.
+//! Search, the playlist list, the liked songs, the saved albums, artists and
+//! shows, and a show's episodes over the web player's GraphQL endpoint, with
+//! the streaming session's own token. Spotify's clients ask there, and it
+//! has no per-app quota, so none of them waits on the shared app's rate
+//! limit.
 //!
 //! Each operation is a persisted one, named by a hash that Spotify moves
 //! with each web player release. A stale hash is refreshed from the
@@ -15,8 +16,8 @@ use serde_json::{Value, json};
 
 use crate::http::Http;
 use crate::api::models::{
-    Album, Artist, ArtistRef, Episode, Image, Owner, Page, Playlist, SavedTrack, SearchResults,
-    Show, Track,
+    Album, Artist, ArtistRef, CursorPage, Episode, Image, Owner, Page, Playlist, ResumePoint,
+    SavedAlbum, SavedShow, SavedTrack, SearchResults, Show, Track,
 };
 use crate::session_reads::Failure;
 
@@ -37,9 +38,19 @@ const CONTAINS: &str = "areEntitiesInLibrary";
 const LIBRARY: &str = "libraryV3";
 const SAVE: &str = "addToLibrary";
 const UNSAVE: &str = "removeFromLibrary";
+const SHOW_EPISODES: &str = "queryPodcastEpisodes";
+
+/// The library's filters, as the web player's own sidebar names them.
+const ALBUMS: &str = "Albums";
+const ARTISTS: &str = "Artists";
+const SHOWS: &str = "Podcasts & Shows";
+/// How many followed artists are read at once before the Web API is asked
+/// to page them instead.
+const FOLLOWED_LIMIT: u32 = 1000;
 
 /// The hashes of the web player build of 2026-10-10, by operation.
-const KNOWN_HASHES: [(&str, &str); 6] = [
+const KNOWN_HASHES: [(&str, &str); 7] = [
+    (SHOW_EPISODES, "3539d746cf882f3909660de40b4ef472b3f5893a0761d617c282541de5d412c5"),
     (LIBRARY, "390c78e5b951029bad359785e69b07b536a509c581cbcd0aded5e5067f187455"),
     (SEARCH, "eef7cc54888d91bdd6802623477873caa3948ae173a0c34fd86827b267e94c03"),
     (SAVED_TRACKS, "087278b20b743578a6262c2b0b4bcd20d879c503cc359a2285baf083ef944240"),
@@ -124,6 +135,202 @@ fn playlist_page(data: &Value, offset: u32, limit: u32) -> Result<Page<Playlist>
         .unwrap_or(seen);
     Ok(Page {
         next: (seen < total).then(String::new),
+        items,
+        total,
+        limit,
+        offset,
+    })
+}
+
+/// One page of the account's saved albums, newest first, as the Web API's
+/// `/me/albums` pages them.
+pub async fn saved_albums(
+    session: &Session,
+    http: &Http,
+    offset: u32,
+    limit: u32,
+) -> Result<Page<SavedAlbum>, Failure> {
+    let (entries, total) = library(session, http, ALBUMS, offset, limit).await?;
+    Ok(paged(albums_in(&entries), entries.len(), total, offset, limit))
+}
+
+/// The albums among the library's entries; a pre-release or anything else
+/// the Web API would not list is left out.
+fn albums_in(entries: &[Value]) -> Vec<SavedAlbum> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            Some(SavedAlbum {
+                added_at: added_at(entry),
+                album: album(&entry["item"]["data"])?,
+            })
+        })
+        .collect()
+}
+
+/// One page of the account's saved shows, newest first, as the Web API's
+/// `/me/shows` pages them.
+pub async fn saved_shows(
+    session: &Session,
+    http: &Http,
+    offset: u32,
+    limit: u32,
+) -> Result<Page<SavedShow>, Failure> {
+    let (entries, total) = library(session, http, SHOWS, offset, limit).await?;
+    Ok(paged(shows_in(&entries), entries.len(), total, offset, limit))
+}
+
+/// The podcasts among the library's entries; audiobooks have a filter of
+/// their own.
+fn shows_in(entries: &[Value]) -> Vec<SavedShow> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            Some(SavedShow {
+                added_at: added_at(entry),
+                show: show(&entry["item"]["data"])?,
+            })
+        })
+        .collect()
+}
+
+/// Every artist the account follows, in one answer: the Web API pages them
+/// by the last artist's id, which the library's own offsets cannot stand
+/// in for. A longer list is the Web API's to page.
+pub async fn followed_artists(
+    session: &Session,
+    http: &Http,
+) -> Result<CursorPage<Artist>, Failure> {
+    let mut artists = Vec::new();
+    let mut offset = 0;
+    loop {
+        let (entries, total) = library(session, http, ARTISTS, offset, 50).await?;
+        if total > FOLLOWED_LIMIT {
+            return Err(Failure::Retry(anyhow::anyhow!(
+                "{total} followed artists are more than one answer holds"
+            )));
+        }
+        artists.extend(artists_in(&entries));
+        offset += entries.len() as u32;
+        if entries.is_empty() || offset >= total {
+            return Ok(CursorPage {
+                total: Some(total),
+                items: artists,
+                next: None,
+                cursors: None,
+            });
+        }
+    }
+}
+
+fn artists_in(entries: &[Value]) -> Vec<Artist> {
+    entries
+        .iter()
+        .filter_map(|entry| artist(&entry["item"]["data"]))
+        .collect()
+}
+
+/// One page of the library's `filter` kind: the entries and how many the
+/// library holds. Spotify answers a sort it does not know with an error
+/// in place of the library, and the default order is asked for instead.
+async fn library(
+    session: &Session,
+    http: &Http,
+    filter: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<(Vec<Value>, u32), Failure> {
+    let mut data = Value::Null;
+    for order in [json!("Recently Added"), Value::Null] {
+        let variables = json!({
+            "filters": [filter],
+            "order": order,
+            "textFilter": "",
+            "features": ["LIKED_SONGS", "YOUR_EPISODES"],
+            "limit": limit,
+            "offset": offset,
+            "flatten": true,
+            "expandedFolders": [],
+            "folderUri": null,
+            "includeFoldersWhenFlattening": false,
+            "withCuration": false,
+        });
+        data = run(session, http, LIBRARY, variables, false).await?;
+        let kind = data["me"]["libraryV3"]["__typename"].as_str().unwrap_or_default();
+        if !kind.ends_with("Error") {
+            break;
+        }
+        data = Value::Null;
+    }
+    let library = data
+        .pointer("/me/libraryV3")
+        .ok_or_else(|| Failure::Retry(anyhow::anyhow!("library answered no {filter}")))?;
+    let entries = library["items"].as_array().cloned().unwrap_or_default();
+    let total = library["totalCount"]
+        .as_u64()
+        .and_then(|total| u32::try_from(total).ok())
+        .unwrap_or(offset.saturating_add(entries.len() as u32));
+    Ok((entries, total))
+}
+
+fn added_at(entry: &Value) -> Option<String> {
+    entry["addedAt"]["isoString"].as_str().map(str::to_string)
+}
+
+/// A page of `items` read from `seen` entries of a library that holds
+/// `total`; the next page is there while entries remain.
+fn paged<T>(items: Vec<T>, seen: usize, total: u32, offset: u32, limit: u32) -> Page<T> {
+    let reached = offset.saturating_add(seen as u32);
+    Page {
+        next: (reached < total && seen > 0).then(String::new),
+        items,
+        total,
+        limit,
+        offset,
+    }
+}
+
+/// One page of a show's episodes, newest first as the show's page lists
+/// them, each with how far the account has listened to it.
+pub async fn show_episodes(
+    session: &Session,
+    http: &Http,
+    id: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<Page<Episode>, Failure> {
+    let variables = json!({
+        "uri": format!("spotify:show:{id}"),
+        "offset": offset,
+        "limit": limit,
+        "includeEpisodeContentRatingsV2": false,
+    });
+    let data = run(session, http, SHOW_EPISODES, variables, false).await?;
+    episodes_page(&data, offset, limit)
+}
+
+fn episodes_page(data: &Value, offset: u32, limit: u32) -> Result<Page<Episode>, Failure> {
+    let retry = |reason: &str| Failure::Retry(anyhow::anyhow!("show episodes: {reason}"));
+    let page = data
+        .pointer("/podcastUnionV2/episodesV2")
+        .filter(|page| page["__typename"] == "ContextEpisodePage")
+        .ok_or_else(|| retry("no page"))?;
+    let entries = page["items"].as_array().ok_or_else(|| retry("no items"))?;
+    // A row left out would move every one after it, and the page's
+    // numbering with it.
+    let items = entries
+        .iter()
+        .map(|entry| episode(&entry["entity"]["data"]).ok_or_else(|| retry("unreadable row")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let total = page["totalCount"]
+        .as_u64()
+        .and_then(|total| u32::try_from(total).ok())
+        .unwrap_or(offset.saturating_add(items.len() as u32));
+    Ok(Page {
+        next: page["pagingInfo"]["nextOffset"]
+            .as_u64()
+            .is_some()
+            .then(String::new),
         items,
         total,
         limit,
@@ -591,6 +798,10 @@ fn episode(data: &Value) -> Option<Episode> {
         images: images(&data["coverArt"]["sources"]),
         release_date: data["releaseDate"]["isoString"].as_str().map(str::to_string),
         explicit: data["contentRating"]["label"] == "EXPLICIT",
+        resume_point: data["playedState"].is_object().then(|| ResumePoint {
+            fully_played: data["playedState"]["state"] == "COMPLETED",
+            resume_position_ms: milliseconds(&data["playedState"]["playPositionMilliseconds"]),
+        }),
         show: show["uri"].as_str().map(|show_uri| Show {
             id: id_of(show_uri),
             uri: show_uri.to_string(),
@@ -882,5 +1093,127 @@ mod tests {
             "a mutation is named the same way"
         );
         assert_eq!(operation_hash(&chunk, "searchNothing"), None);
+    }
+
+    fn library_entry(kind: &str, data: Value) -> Value {
+        json!({
+            "addedAt": {"isoString": "2026-10-01T10:00:00Z"},
+            "item": {"__typename": kind, "data": data},
+        })
+    }
+
+    #[test]
+    fn saved_albums_read_with_when_they_were_added() {
+        let entries = vec![
+            library_entry(
+                "AlbumResponseWrapper",
+                json!({
+                    "__typename": "Album",
+                    "uri": "spotify:album:AAA",
+                    "name": "One",
+                    "type": "EP",
+                    "artists": {"items": [{"uri": "spotify:artist:XXX", "profile": {"name": "Band"}}]},
+                    "coverArt": {"sources": [{"url": "https://i.scdn.co/image/a", "width": 300, "height": 300}]},
+                    "date": {"year": 2020},
+                }),
+            ),
+            library_entry("PreReleaseResponseWrapper", json!({"__typename": "PreRelease"})),
+        ];
+        let albums = albums_in(&entries);
+        assert_eq!(albums.len(), 1, "a pre-release is not in the Web API's list");
+        assert_eq!(albums[0].added_at.as_deref(), Some("2026-10-01T10:00:00Z"));
+        let album = &albums[0].album;
+        assert_eq!((album.id.as_str(), album.name.as_str()), ("AAA", "One"));
+        assert_eq!(album.album_type.as_deref(), Some("single"), "an EP is a single");
+        assert_eq!(album.artists[0].name, "Band");
+        assert_eq!(album.release_date.as_deref(), Some("2020"));
+    }
+
+    #[test]
+    fn saved_shows_and_followed_artists_read_by_their_kind() {
+        let shows = shows_in(&[
+            library_entry(
+                "PodcastResponseWrapper",
+                json!({
+                    "__typename": "Podcast",
+                    "uri": "spotify:show:SSS",
+                    "name": "Talk",
+                    "publisher": {"name": "Radio"},
+                    "coverArt": {"sources": []},
+                }),
+            ),
+            library_entry("AudiobookResponseWrapper", json!({"__typename": "Audiobook"})),
+        ]);
+        assert_eq!(shows.len(), 1);
+        assert_eq!(shows[0].show.publisher, "Radio");
+
+        let artists = artists_in(&[library_entry(
+            "ArtistResponseWrapper",
+            json!({
+                "__typename": "Artist",
+                "uri": "spotify:artist:RRR",
+                "profile": {"name": "Singer"},
+                "visuals": {"avatarImage": {"sources": [{"url": "https://i.scdn.co/image/r"}]}},
+            }),
+        )]);
+        assert_eq!(artists[0].name, "Singer");
+        assert_eq!(artists[0].images.len(), 1);
+    }
+
+    #[test]
+    fn a_page_goes_on_while_entries_remain() {
+        let page = paged(vec![1, 2], 2, 5, 0, 2);
+        assert!(page.next.is_some());
+        let last = paged(vec![5], 1, 5, 4, 2);
+        assert!(last.next.is_none());
+        let empty: Page<u8> = paged(Vec::new(), 0, 9, 4, 2);
+        assert!(empty.next.is_none(), "an empty answer never loops");
+    }
+
+    fn episode_entry(name: &str, state: Value) -> Value {
+        json!({"entity": {"data": {
+            "__typename": "Episode",
+            "uri": format!("spotify:episode:{name}"),
+            "name": name,
+            "description": "d",
+            "duration": {"totalMilliseconds": 60_000},
+            "releaseDate": {"isoString": "2026-10-01T00:00:00Z"},
+            "coverArt": {"sources": []},
+            "playedState": state,
+        }}})
+    }
+
+    #[test]
+    fn show_episodes_carry_how_far_they_were_heard() {
+        let data = json!({"podcastUnionV2": {"episodesV2": {
+            "__typename": "ContextEpisodePage",
+            "totalCount": 3,
+            "pagingInfo": {"nextOffset": 2},
+            "items": [
+                episode_entry("a", json!({"state": "IN_PROGRESS", "playPositionMilliseconds": 15_000})),
+                episode_entry("b", json!({"state": "COMPLETED", "playPositionMilliseconds": 60_000})),
+            ],
+        }}});
+        let page = episodes_page(&data, 0, 2).unwrap();
+        assert_eq!(page.total, 3);
+        assert!(page.next.is_some());
+        let first = page.items[0].resume_point.as_ref().unwrap();
+        assert_eq!((first.fully_played, first.resume_position_ms), (false, 15_000));
+        assert!(page.items[1].resume_point.as_ref().unwrap().fully_played);
+    }
+
+    #[test]
+    fn a_show_page_with_an_unreadable_row_is_left_to_the_web_api() {
+        let data = json!({"podcastUnionV2": {"episodesV2": {
+            "__typename": "ContextEpisodePage",
+            "totalCount": 2,
+            "pagingInfo": {"nextOffset": null},
+            "items": [
+                episode_entry("a", Value::Null),
+                {"entity": {"data": {"__typename": "NotFound"}}},
+            ],
+        }}});
+        assert!(episodes_page(&data, 0, 2).is_err());
+        assert!(episodes_page(&json!({}), 0, 2).is_err());
     }
 }
