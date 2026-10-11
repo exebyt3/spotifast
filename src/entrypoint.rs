@@ -408,13 +408,11 @@ pub(crate) fn run() -> eframe::Result<()> {
     } else {
         None
     };
-    let default_filter = if cli.verbose {
-        "info,librespot=info,spotifast=debug"
-    } else {
-        // Which system face draws each script the interface font lacks,
-        // one line per script at startup, for reports of odd-looking text.
-        "warn,spotifast=info,fastframe_fonts=info"
-    };
+    // The widest the log may get; how much of it is kept is the settings'
+    // log switches, which change the level while the app runs. Which system
+    // face draws each script the interface font lacks is one line per script
+    // at startup, for reports of odd-looking text.
+    let default_filter = "warn,spotifast=debug,librespot=info,fastframe_fonts=info";
     let dirs = paths::AppDirs::discover();
     #[cfg(feature = "demo")]
     let dirs = cli
@@ -445,6 +443,11 @@ pub(crate) fn run() -> eframe::Result<()> {
         log::warn!("unable to create the application directories: {error}");
     }
     let mut settings = settings::Settings::load(&dirs.settings_file());
+    log::set_max_level(if cli.verbose {
+        log::LevelFilter::Debug
+    } else {
+        settings.log_level()
+    });
     if let Some(name) = cli.device_name {
         settings.device_name = name;
     }

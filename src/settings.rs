@@ -321,6 +321,10 @@ pub struct Settings {
     /// Windows and Linux: draw Spotifast's own title bar and window buttons
     /// instead of the desktop frame.
     pub custom_titlebar: bool,
+    /// Write the run's log file at all.
+    pub logging: bool,
+    /// Log Spotifast's debug lines too: every request's route and timing.
+    pub detailed_log: bool,
     /// Skin file or folder name. `None` selects the built-in skin.
     pub skin: Option<String>,
     /// Pick a different skin each time the mini player opens; `skin` holds
@@ -411,6 +415,17 @@ impl std::fmt::Debug for Settings {
     }
 }
 
+impl Settings {
+    /// How much the log keeps, as the two log switches set it.
+    pub fn log_level(&self) -> log::LevelFilter {
+        match (self.logging, self.detailed_log) {
+            (false, _) => log::LevelFilter::Off,
+            (true, false) => log::LevelFilter::Info,
+            (true, true) => log::LevelFilter::Debug,
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -460,6 +475,8 @@ impl Default for Settings {
             winamp_window: false,
             winamp_show_taskbar: true,
             custom_titlebar: false,
+            logging: true,
+            detailed_log: false,
             skin: None,
             random_skin: false,
             skin_scale: None,

@@ -30,7 +30,7 @@ use protobuf::{EnumOrUnknown, Message as _};
 use crate::api::ApiError;
 use crate::api::models::{
     Album, Artist, ArtistRef, Copyright, Episode, ExternalIds, Image, Owner, Page, PlayableItem,
-    Playlist, PlaylistItem, Show, Track, TrackCount, UserRef,
+    Playlist, PlaylistItem, Show, Track, TrackCount, User, UserRef,
 };
 
 const IMAGE_HOST: &str = "https://i.scdn.co/image/";
@@ -171,6 +171,175 @@ pub async fn station(session: &Session, station: &str) -> anyhow::Result<Vec<Tra
             Failure::Retry(error) => error,
         })?;
     Ok(tracks_in_order(&uris, &found))
+}
+
+/// The account the session signed in as, as far as the session itself
+/// knows it: no name or picture, which [`profile`] adds.
+pub fn account(session: &Session) -> User {
+    let id = session.username();
+    User {
+        uri: Some(format!("spotify:user:{id}")),
+        product: session.get_user_attribute("type"),
+        country: Some(session.country()).filter(|country| !country.is_empty()),
+        id,
+        ..Default::default()
+    }
+}
+
+/// The session's account with the name and picture of its public profile.
+pub async fn profile(session: &Session) -> anyhow::Result<User> {
+    let mut user = account(session);
+    let body = session
+        .spclient()
+        .get_user_profile(&user.id, Some(0), Some(0))
+        .await?;
+    named(&mut user, &serde_json::from_slice(&body)?);
+    Ok(user)
+}
+
+fn named(user: &mut User, profile: &serde_json::Value) {
+    user.display_name = profile["name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    if let Some(url) = profile["image_url"].as_str().filter(|url| !url.is_empty()) {
+        user.images = vec![Image {
+            url: url.to_string(),
+            width: None,
+            height: None,
+        }];
+    }
+}
+
+/// The songs of a context Spotify builds for each listener, the DJ among
+/// them: its resolved context holds no songs but names, in
+/// `lexicon_context_url`, the session service that does. `None` for any
+/// context that lists its own songs.
+pub async fn session_context(session: &Session, uri: &str) -> anyhow::Result<Option<Vec<String>>> {
+    let context = session.spclient().get_context(uri).await?;
+    if context.pages.iter().any(|page| !page.tracks.is_empty()) {
+        return Ok(None);
+    }
+    let Some(url) = context.metadata.get("lexicon_context_url") else {
+        return Ok(None);
+    };
+    // `hm://service/path` is `/service/path` on the spclient.
+    let path = url
+        .strip_prefix("hm:/")
+        .filter(|path| path.starts_with('/'))
+        .ok_or_else(|| anyhow::anyhow!("unexpected session url {url}"))?;
+    let bytes = session
+        .spclient()
+        .request(&http::Method::GET, path, None, None)
+        .await?;
+    let uris = if bytes.first() == Some(&b'{') {
+        session_pages(session, &bytes).await?
+    } else {
+        let context = librespot_protocol::context::Context::parse_from_bytes(&bytes)?;
+        context
+            .pages
+            .iter()
+            .flat_map(|page| &page.tracks)
+            .filter_map(|track| track.uri.clone())
+            .filter(|uri| is_song_uri(uri))
+            .collect()
+    };
+    if uris.is_empty() {
+        anyhow::bail!("session {path} listed no songs");
+    }
+    Ok(Some(uris))
+}
+
+/// How many new songs a session is followed for. Its first page stays the
+/// same for hours, so the songs already handed out are skipped and its later
+/// pages, five songs each, read until this many are new.
+const SESSION_SONGS: usize = 20;
+/// How many pages to read at most for them.
+const SESSION_PAGES: usize = 12;
+/// How many handed-out songs are remembered.
+const PLAYED_KEPT: usize = 1000;
+
+/// The session's songs not handed out before, in order, from the first
+/// page's answer. When every song read was handed out already, all of them;
+/// a later page that fails leaves the songs gathered so far.
+async fn session_pages(session: &Session, first: &[u8]) -> anyhow::Result<Vec<String>> {
+    let path = crate::paths::AppDirs::discover()
+        .state
+        .join("session-played.json");
+    let mut played: Vec<String> = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let before: BTreeSet<String> = played.iter().cloned().collect();
+    let (mut fresh, mut all) = (Vec::new(), Vec::new());
+    let mut answer = first.to_vec();
+    for number in 0..SESSION_PAGES {
+        let json: serde_json::Value = serde_json::from_slice(&answer)?;
+        for song in songs_in_json(&json) {
+            if !before.contains(&song) && !fresh.contains(&song) {
+                fresh.push(song.clone());
+            }
+            all.push(song);
+        }
+        if fresh.len() >= SESSION_SONGS {
+            break;
+        }
+        let Some(next) = next_session_page(&json) else {
+            break;
+        };
+        answer = match session
+            .spclient()
+            .request(&http::Method::GET, next, None, None)
+            .await
+        {
+            Ok(bytes) if bytes.first() == Some(&b'{') => bytes.to_vec(),
+            Ok(_) => break,
+            Err(error) => {
+                log::warn!("session page {} failed: {error}", number + 1);
+                break;
+            }
+        };
+    }
+    let songs = if fresh.is_empty() { all } else { fresh };
+    played.extend(songs.iter().cloned());
+    played.drain(..played.len().saturating_sub(PLAYED_KEPT));
+    if let Err(error) = std::fs::write(&path, serde_json::to_vec(&played)?) {
+        log::warn!("could not remember the session's songs: {error}");
+    }
+    Ok(songs)
+}
+
+/// The pages of a session answer: the first wraps them in `pages`, each
+/// later one is a page itself.
+fn session_page_list(answer: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match answer["pages"].as_array() {
+        Some(pages) => pages.iter().collect(),
+        None => vec![answer],
+    }
+}
+
+/// The spclient path of the page after `answer`.
+fn next_session_page(answer: &serde_json::Value) -> Option<&str> {
+    session_page_list(answer)
+        .last()?["next_page_url"]
+        .as_str()?
+        .strip_prefix("hm:/")
+        .filter(|path| path.starts_with('/'))
+}
+
+fn is_song_uri(uri: &str) -> bool {
+    uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:")
+}
+
+/// The song URIs of a context as JSON, page by page in order.
+fn songs_in_json(context: &serde_json::Value) -> Vec<String> {
+    session_page_list(context)
+        .into_iter()
+        .flat_map(|page| page["tracks"].as_array().into_iter().flatten())
+        .filter_map(|track| track["uri"].as_str())
+        .filter(|uri| is_song_uri(uri))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The songs among `found`, in the order of `uris`; a URI with no song
@@ -1045,6 +1214,46 @@ fn iso8601(timestamp_ms: i64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_public_profile_names_the_account() {
+        let mut user = super::User {
+            id: "abc".into(),
+            ..Default::default()
+        };
+        super::named(
+            &mut user,
+            &serde_json::json!({"name": "Alice", "image_url": "https://i.scdn.co/image/x"}),
+        );
+        assert_eq!(user.name(), "Alice");
+        assert_eq!(user.images[0].url, "https://i.scdn.co/image/x");
+        super::named(&mut user, &serde_json::json!({}));
+        assert_eq!(user.name(), "abc");
+    }
+
+    #[test]
+    fn a_session_context_lists_its_songs_page_by_page() {
+        let context = serde_json::json!({"pages": [
+            {"tracks": [{"uri": "spotify:track:a"}, {"uri": "spotify:ad:x"}]},
+            {"tracks": [{"uri": "spotify:episode:b"}]}
+        ]});
+        assert_eq!(
+            songs_in_json(&context),
+            ["spotify:track:a", "spotify:episode:b"]
+        );
+        assert!(songs_in_json(&serde_json::json!({})).is_empty());
+        // A later page is a page itself, not wrapped in `pages`.
+        let later = serde_json::json!({
+            "next_page_url": "hm://lexicon-session-provider/next?previousSegmentId=2",
+            "tracks": [{"uri": "spotify:track:c"}]
+        });
+        assert_eq!(songs_in_json(&later), ["spotify:track:c"]);
+        assert_eq!(
+            next_session_page(&later),
+            Some("/lexicon-session-provider/next?previousSegmentId=2")
+        );
+        assert_eq!(next_session_page(&context), None);
+    }
     use librespot_metadata::Metadata as _;
     use librespot_protocol::playlist4_external::{Item, SelectedListContent};
 

@@ -1812,6 +1812,19 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 "Sign-ins are saved in the system credential store when available.",
             ),
         ),
+        RowText::new(
+            gettext(locale, "Log"),
+            // Translators: {file} is the path of the log file.
+            gettext(locale, "Each run writes its log to {file}.")
+                .replace("{file}", &app.dirs.log_file().display().to_string()),
+        ),
+        RowText::new(
+            gettext(locale, "Detailed log"),
+            gettext(
+                locale,
+                "Also log where each request goes and how long it takes.",
+            ),
+        ),
     ];
     if section_matches(&needle, &storage, &storage_rows) {
         any_visible = true;
@@ -1844,6 +1857,31 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 }
             });
             filtered_row(ui, &palette, &needle, &storage, &storage_rows[3], |_| {});
+            let mut log_changed = false;
+            filtered_row(ui, &palette, &needle, &storage, &storage_rows[4], |ui| {
+                log_changed |= widgets::switch(
+                    ui,
+                    &palette,
+                    &storage_rows[4].title,
+                    &mut app.settings.logging,
+                )
+                .changed();
+            });
+            if app.settings.logging {
+                filtered_row(ui, &palette, &needle, &storage, &storage_rows[5], |ui| {
+                    log_changed |= widgets::switch(
+                        ui,
+                        &palette,
+                        &storage_rows[5].title,
+                        &mut app.settings.detailed_log,
+                    )
+                    .changed();
+                });
+            }
+            if log_changed {
+                log::set_max_level(app.settings.log_level());
+                changed = true;
+            }
         });
     }
 

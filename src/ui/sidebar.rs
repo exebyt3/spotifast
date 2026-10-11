@@ -791,6 +791,30 @@ fn folder_playlists(rootlist: &[crate::player::RootlistEntry], id: &str) -> usiz
     count
 }
 
+/// Spotify's DJ, the same playlist for every account.
+const DJ_URI: &str = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
+
+fn dj_entry(locale: Locale) -> Entry {
+    Entry {
+        image: None,
+        grid_image: None,
+        name: "DJ".into(),
+        // Translators: {owner} is the name of the playlist's owner.
+        subtitle: gettext(locale, "Playlist • {owner}").replace("{owner}", "Spotify"),
+        grid_subtitle: "Spotify".into(),
+        page: Page::Playlist(DJ_URI.trim_start_matches("spotify:playlist:").into()),
+        uri: DJ_URI.into(),
+        round: false,
+        liked: false,
+        owned: false,
+        editable: false,
+        playlist_index: None,
+        folder: None,
+        depth: 0,
+        added_at: None,
+    }
+}
+
 fn playlist_entry(
     locale: Locale,
     playlist: &crate::api::models::Playlist,
@@ -1087,6 +1111,15 @@ fn contents(app: &mut App, ui: &mut egui::Ui, grid_art: Option<Rect>) {
                 }
                 Loadable::Loading | Loadable::NotLoaded => loading = true,
                 Loadable::Failed(message) => error = Some(message.clone()),
+            }
+            // Spotify's DJ is every account's playlist, yet a library lists
+            // it only once it was added from Spotify's own apps. Keep it in
+            // reach rather than leave it to a pasted link.
+            if let Loadable::Loaded(playlists) = &app.library.playlists
+                && !playlists.iter().any(|playlist| playlist.uri == DJ_URI)
+                && (needle.is_empty() || "dj".contains(&needle))
+            {
+                entries.push(dj_entry(locale));
             }
         }
         Filter::Albums => {

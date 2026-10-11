@@ -27,7 +27,7 @@ use crate::images::{ArtLoader, accent_color};
 use crate::model::PlaylistCache;
 use crate::paths::AppDirs;
 use crate::player::{
-    Engine, EngineConfig, EngineEvent, Heard, LocalState, PlaybackResume, PlayerCommand,
+    Engine, EngineConfig, EngineEvent, Heard, LoadSpec, LocalState, PlaybackResume, PlayerCommand,
 };
 use crate::session_reads;
 use crate::settings::ProxyConfig;
@@ -38,6 +38,7 @@ const PREMIUM_NEEDED: &str = "Local playback needs Spotify Premium.";
 const ALBUM_TYPE_TIMEOUT: Duration = Duration::from_secs(30);
 // Leave time for access-point retries plus resolver and authentication work.
 const ENGINE_CONNECT_TIMEOUT: Duration = Duration::from_secs(75);
+const CONNECT_TIMED_OUT: &str = "Connecting to Spotify timed out";
 // Keep at most one full Web API album page outstanding for a playback engine.
 const MAX_PENDING_ALBUM_TYPES: usize = 50;
 // Saved shows asked about in one extended-metadata request.
@@ -602,6 +603,8 @@ pub enum Command {
         config: ProxyConfig,
     },
     Player(PlayerCommand),
+    /// A player command whose context has been looked up already.
+    PlayerResolved(PlayerCommand),
     Api(ApiRequest),
     ApiFinished {
         generation: u64,
@@ -1235,6 +1238,16 @@ impl Backend {
     }
 }
 
+/// The context to look the songs of up in its session: Spotify's own
+/// personal mixes (the DJ, daily mixes), loaded by URI and not as autoplay.
+fn session_context_of(spec: &LoadSpec) -> Option<String> {
+    spec.context_uri
+        .as_deref()
+        .filter(|uri| uri.starts_with("spotify:playlist:37i9dQZF1E"))
+        .filter(|_| !spec.autoplay && spec.uris.is_empty())
+        .map(str::to_owned)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AlbumTypeRequest {
     uri: String,
@@ -1351,6 +1364,9 @@ struct Worker {
     /// True while a playback grant or engine connection is in flight, so a
     /// second attempt does not pile up.
     engine_busy: bool,
+    /// Reads the streaming session serves, asked while it was connecting:
+    /// they wait for it rather than spend the Web API's rate limit.
+    parked: Vec<ApiRequest>,
     search_tasks: Vec<tokio::task::AbortHandle>,
     /// A user changed engine-affecting settings while the current connection
     /// attempt was in flight. Its result is stale and must not be installed.
@@ -1414,6 +1430,7 @@ impl Worker {
             audiobook_lookup: BTreeSet::new(),
             radio_waiting: BTreeMap::new(),
             engine_busy: false,
+            parked: Vec::new(),
             search_tasks: Vec::new(),
             engine_restart_pending: false,
             signed_in: false,
@@ -1695,7 +1712,12 @@ impl Worker {
                 Command::ApplyProxy { request, config } => {
                     self.change_proxy(request, config, false)
                 }
-                Command::Player(command) => match &self.engine {
+                Command::Player(PlayerCommand::Load(spec))
+                    if self.engine.is_some() && session_context_of(&spec).is_some() =>
+                {
+                    self.load_session_context(spec);
+                }
+                Command::Player(command) | Command::PlayerResolved(command) => match &self.engine {
                     Some(engine) => {
                         if let Err(error) = engine.command(command) {
                             self.emit(Event::Error(format!("Playback error: {error}")));
@@ -1706,6 +1728,14 @@ impl Worker {
                     )),
                 },
                 Command::Api(ApiRequest::Search { query, serial }) => self.search(query, serial),
+                Command::Api(request)
+                    if self.engine.is_none()
+                        && self.engine_busy
+                        && session_read(&request).is_some()
+                        && self.api.session_serves(operation_for(&self.api, &request)) =>
+                {
+                    self.parked.push(request);
+                }
                 Command::Api(request) => {
                     self.dispatch(request);
                 }
@@ -1808,7 +1838,7 @@ impl Worker {
                     error,
                     lease,
                 } => {
-                    if lease.current() && self.signed_in {
+                    if lease.current() && (self.signed_in || self.session_may_sign_in()) {
                         self.on_engine_connected(session_generation, *engine, error)
                     } else if let Some(engine) = *engine {
                         engine.shutdown();
@@ -2213,6 +2243,9 @@ impl Worker {
                 error,
             });
         });
+        if source == ApiSource::Shared {
+            self.resume_engine();
+        }
     }
 
     fn forget_web_grant(&mut self, source: ApiSource) {
@@ -2252,12 +2285,34 @@ impl Worker {
     }
 
     fn on_web_verified(&mut self, source: ApiSource, token: crate::auth::StoredToken, user: User) {
+        // Signed in from the streaming session before `/me` answered.
+        if source == ApiSource::Shared
+            && let SessionState::Ready { account } = self.api.state(source)
+        {
+            if account.as_str() != user.id {
+                if let Some(engine) = self.engine.take() {
+                    engine.shutdown();
+                }
+                self.on_web_verification_failed(
+                    source,
+                    ApiError::Status {
+                        status: 403,
+                        message: "The Spotify grants belong to different accounts".into(),
+                    },
+                );
+            }
+            return;
+        }
         if !matches!(self.api.state(source), SessionState::Authorizing)
             || source == ApiSource::Personal
                 && self.web_client_id.as_deref() != Some(token.client_id.as_str())
         {
             return;
         }
+        self.account_verified(source, user, token.client_id);
+    }
+
+    fn account_verified(&mut self, source: ApiSource, user: User, client_id: String) {
         if let Err(error) = self.api.install(source, AccountId::new(user.id.clone())) {
             self.api.clear(source);
             if source == ApiSource::Shared {
@@ -2290,7 +2345,7 @@ impl Worker {
             }
             ApiSource::Personal => {
                 self.emit(Event::WebApp {
-                    client_id: Some(token.client_id),
+                    client_id: Some(client_id),
                 });
                 if !self.signed_in {
                     self.signed_in = true;
@@ -2469,6 +2524,7 @@ impl Worker {
         self.web_tokens = [None, None];
         self.playback_grant = None;
         self.engine_busy = false;
+        self.parked.clear();
         self.premium = None;
         self.resume = None;
         self.resume_verify = None;
@@ -2529,7 +2585,7 @@ impl Worker {
     /// Bring the engine up from a credential stored by a previous playback
     /// authorization, if there is one. Silent when there is nothing to resume.
     fn resume_engine(&mut self) {
-        if !self.signed_in
+        if !(self.signed_in || self.session_may_sign_in())
             || self.engine.is_some()
             || self.engine_busy
             || self.premium == Some(false)
@@ -2537,8 +2593,10 @@ impl Worker {
             return;
         }
         if let Some(credentials) = self.playback_grant.clone() {
-            if credentials.username.as_deref()
-                != self.api.account().as_ref().map(|account| account.as_str())
+            // Before the Web API check the account is the grant's own; the
+            // session it opens says who that is.
+            if let Some(account) = self.api.account()
+                && credentials.username.as_deref() != Some(account.as_str())
             {
                 self.emit(Event::Playback(LocalPlayback::Failed(
                     "Stored playback belongs to another Spotify account. Enable playback again."
@@ -2548,6 +2606,41 @@ impl Worker {
             }
             self.connect_engine(credentials);
         }
+    }
+
+    /// Whether a restored sign-in still waits on the Web API's account check,
+    /// which the streaming session can answer instead: Spotify answers the
+    /// Web API's `/me` behind the shared app's rate limit, often half a
+    /// minute late, and nothing loads until it does.
+    fn session_may_sign_in(&self) -> bool {
+        !self.signed_in
+            && self.web_tokens[web_slot(ApiSource::Shared).index()].is_some()
+            && matches!(self.api.state(ApiSource::Shared), SessionState::Authorizing)
+    }
+
+    /// Signs in as the account the engine's session belongs to. The stored
+    /// web grant and the playback grant come from the same sign-in; a late
+    /// `/me` that names someone else still signs out.
+    // ponytail: a Free account is only learnt here, after librespot has
+    // connected; one downgraded since its playback grant was stored would
+    // hit librespot's exit(1). Wait for /me when the stored plan is unknown
+    // if that ever happens.
+    fn sign_in_from_session(&mut self, engine: &Engine) {
+        let user = session_reads::account(engine.session());
+        log::info!("signed in as {} from the streaming session", user.id);
+        self.account_verified(ApiSource::Shared, user, String::new());
+        let session = engine.session().clone();
+        let events = self.events.clone();
+        let waker = self.waker.clone();
+        tokio::spawn(async move {
+            match session_reads::profile(&session).await {
+                Ok(user) => {
+                    let _ = events.send(Event::Api(Box::new(ApiResponse::Me(Ok(user)))));
+                    waker.wake();
+                }
+                Err(error) => log::debug!("session profile unavailable: {error}"),
+            }
+        });
     }
 
     /// Replace the engine after a user-initiated change (audio settings or
@@ -2759,7 +2852,7 @@ impl Worker {
                     lease: lease.clone(),
                     session_generation,
                     engine: Box::new(None),
-                    error: Some("Connecting to Spotify timed out".into()),
+                    error: Some(CONNECT_TIMED_OUT.into()),
                 },
             };
             let _ = commands.send(outcome);
@@ -2774,11 +2867,35 @@ impl Worker {
         engine: Option<Engine>,
         error: Option<String>,
     ) {
-        if !self.signed_in || session_generation != self.album_type_lookup.session_generation {
+        self.install_engine(session_generation, engine, error);
+        // Up or given up on: what waited for the session goes now, to the
+        // session or, failing it, the Web API.
+        if !self.engine_busy {
+            for request in std::mem::take(&mut self.parked) {
+                self.dispatch(request);
+            }
+        }
+    }
+
+    fn install_engine(
+        &mut self,
+        session_generation: u64,
+        engine: Option<Engine>,
+        error: Option<String>,
+    ) {
+        if !(self.signed_in || self.session_may_sign_in())
+            || session_generation != self.album_type_lookup.session_generation
+        {
             if let Some(engine) = engine {
                 engine.shutdown();
             }
             return;
+        }
+        // Still busy here, so signing in does not start a second engine.
+        if let Some(engine) = &engine
+            && !self.signed_in
+        {
+            self.sign_in_from_session(engine);
         }
         self.engine_busy = false;
         if std::mem::take(&mut self.engine_restart_pending) {
@@ -2827,8 +2944,21 @@ impl Worker {
                 self.start_radio();
             }
             None => {
-                self.resume = None;
                 let message = error.unwrap_or_else(|| "Local playback is unavailable".into());
+                // Spotify unreachable for a moment, as while a VPN switches
+                // profile: try again, within the reconnect limit, with the
+                // playback to resume kept, instead of leaving playback dead
+                // until the user re-enables it.
+                if connect_failure_is_transient(&message) {
+                    log::info!("engine connect failed ({message}); trying again in 5 s");
+                    let commands = self.commands.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        let _ = commands.send(Command::Reconnect);
+                    });
+                    return;
+                }
+                self.resume = None;
                 self.emit(Event::Playback(LocalPlayback::Failed(message)));
             }
         }
@@ -3100,6 +3230,46 @@ impl Worker {
         }
     }
 
+    /// Plays a mix Spotify builds per listener, the DJ among them, whose
+    /// context lists no songs for librespot to load: the songs come from the
+    /// session service the context names. A context that does list its
+    /// songs, or a lookup that fails, loads as asked.
+    fn load_session_context(&mut self, spec: LoadSpec) {
+        let (Some(engine), Some(uri)) = (self.engine.clone(), session_context_of(&spec)) else {
+            return;
+        };
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let lookup = tokio::time::timeout(
+                RADIO_TIMEOUT,
+                session_reads::session_context(engine.session(), &uri),
+            )
+            .await;
+            let spec = match lookup {
+                Ok(Ok(Some(uris))) => {
+                    log::info!("{uri} plays {} songs from its session", uris.len());
+                    LoadSpec {
+                        context_uri: None,
+                        uris,
+                        offset_uri: None,
+                        offset_index: None,
+                        ..spec
+                    }
+                }
+                Ok(Ok(None)) => spec,
+                Ok(Err(error)) => {
+                    log::warn!("session of {uri} failed: {error:#}");
+                    spec
+                }
+                Err(_) => {
+                    log::warn!("session of {uri} took too long");
+                    spec
+                }
+            };
+            let _ = commands.send(Command::PlayerResolved(PlayerCommand::Load(spec)));
+        });
+    }
+
     fn start_album_type_lookup(&mut self) {
         let Some(engine) = self.engine.clone() else {
             return;
@@ -3311,6 +3481,11 @@ impl Worker {
             }
         });
     }
+}
+
+/// A failure to reach Spotify at all, one that a moment's wait can cure.
+fn connect_failure_is_transient(message: &str) -> bool {
+    message == CONNECT_TIMED_OUT || message.starts_with("Couldn't reach Spotify")
 }
 
 fn friendly_connect_error(error: &anyhow::Error) -> String {
@@ -6499,6 +6674,73 @@ mod authorization_tests {
                 .try_iter()
                 .any(|event| matches!(event, Event::Error(_)))
         );
+    }
+
+    #[test]
+    fn a_restored_sign_in_may_come_from_the_session_until_verified() {
+        let (runtime, mut worker, _events) = worker("session-sign-in");
+        let _entered = runtime.enter();
+        assert!(!worker.session_may_sign_in(), "nothing restored");
+        worker
+            .api
+            .set_state(ApiSource::Shared, SessionState::Authorizing);
+        let lease = worker.credentials.lease(CredentialSlot::Shared);
+        worker.web_tokens[web_slot(ApiSource::Shared).index()] = Some(WebTokens::new(
+            worker.http.clone(),
+            crate::auth::StoredToken::default(),
+            lease.clone(),
+            ApiSource::Shared,
+            worker.storage_notice(lease),
+        ));
+        assert!(worker.session_may_sign_in());
+        verify(&mut worker, ApiSource::Shared, "alice");
+        assert!(!worker.session_may_sign_in());
+    }
+
+    #[test]
+    fn a_late_web_check_naming_another_account_signs_out() {
+        let (runtime, mut worker, _events) = worker("late-me");
+        let _entered = runtime.enter();
+        worker
+            .api
+            .set_state(ApiSource::Shared, SessionState::Authorizing);
+        worker.account_verified(
+            ApiSource::Shared,
+            User {
+                id: "alice".into(),
+                ..Default::default()
+            },
+            String::new(),
+        );
+        assert!(worker.signed_in);
+        let token = crate::auth::StoredToken {
+            client_id: crate::auth::DEFAULT_WEB_CLIENT_ID.into(),
+            ..Default::default()
+        };
+        let user = |id: &str| User {
+            id: id.into(),
+            ..Default::default()
+        };
+        worker.on_web_verified(ApiSource::Shared, token.clone(), user("alice"));
+        assert!(worker.signed_in);
+        worker.on_web_verified(ApiSource::Shared, token, user("bob"));
+        assert!(!worker.signed_in);
+        assert!(worker.api.account().is_none());
+    }
+
+    #[test]
+    fn reads_parked_for_a_connecting_session_go_once_it_gives_up() {
+        let (runtime, mut worker, _events) = worker("parked");
+        let _entered = runtime.enter();
+        worker.signed_in = true;
+        worker.engine_busy = true;
+        worker.parked.push(ApiRequest::MyPlaylists {
+            offset: 0,
+            generation: 1,
+        });
+        let generation = worker.album_type_lookup.session_generation;
+        worker.on_engine_connected(generation, None, Some("Spotify refused".into()));
+        assert!(worker.parked.is_empty());
     }
 
     #[test]
