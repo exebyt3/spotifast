@@ -615,7 +615,7 @@ pub async fn artist_albums(
     .await?;
     let items = window
         .iter()
-        .filter_map(|(group, uri)| release(group, found.get(&uri.to_uri().ok()?)?))
+        .filter_map(|(group, uri)| release(group, found.get(&uri.to_uri())?))
         .collect();
     Ok(Page {
         items,
@@ -640,7 +640,7 @@ pub async fn related_artists(session: &Session, id: &str) -> Result<Vec<Artist>,
     Ok(uris
         .iter()
         .filter_map(|uri| {
-            let message = ArtistMessage::parse_from_bytes(found.get(&uri.to_uri().ok()?)?).ok()?;
+            let message = ArtistMessage::parse_from_bytes(found.get(&uri.to_uri())?).ok()?;
             artist_model(&message).ok()
         })
         .collect())
@@ -672,10 +672,10 @@ pub async fn album_tracks(
     let found = metadata(session, window.iter().copied()).await?;
     let mut items = Vec::with_capacity(window.len());
     for uri in window {
-        let song = uri.to_uri().ok().and_then(|text| match found.get(&text) {
+        let song = match found.get(&uri.to_uri()) {
             Some(PlayableItem::Track(track)) => Some(track.clone()),
             _ => None,
-        });
+        };
         // The Web API's album songs carry no album of their own.
         items.push(song.map(|track| Track { album: None, ..track }).ok_or_else(|| {
             Failure::Retry(anyhow::anyhow!("no details for a song of album {id}"))
@@ -719,7 +719,7 @@ pub async fn episode_by_id(session: &Session, id: &str) -> Result<Episode, Failu
         EpisodeMessage::parse_from_bytes(&bytes).map_err(|error| Failure::Retry(error.into()))?;
     let show_id = SpotifyId::from_raw(message.show.gid())
         .ok()
-        .and_then(|id| id.to_base62().ok());
+        .map(|id| id.to_base62());
     Ok(episode(SessionEpisode::try_from(&message)?, show_id))
 }
 
@@ -741,8 +741,8 @@ pub async fn show(session: &Session, id: &str) -> Result<Show, Failure> {
         return Err(Failure::Retry(anyhow::anyhow!("{id} is an audiobook")));
     }
     Ok(Show {
-        id: parsed.id.to_id().unwrap_or_default(),
-        uri: parsed.id.to_uri().unwrap_or_default(),
+        id: parsed.id.to_id(),
+        uri: parsed.id.to_uri(),
         name: parsed.name.clone(),
         publisher: parsed.publisher.clone(),
         description: parsed.description.clone(),
@@ -774,9 +774,8 @@ pub async fn duplicates(
         let total = total(&list);
         complete(rows.len(), offset, DUPLICATE_WINDOW, total)?;
         for row in rows {
-            if let Ok(uri) = row.id.to_uri()
-                && wanted.contains(uri.as_str())
-            {
+            let uri = row.id.to_uri();
+            if wanted.contains(uri.as_str()) {
                 found.insert(uri);
             }
         }
@@ -825,8 +824,8 @@ fn artist_model(message: &ArtistMessage) -> Result<Artist, Failure> {
         &parsed.portraits
     };
     Ok(Artist {
-        id: parsed.id.to_id().unwrap_or_default(),
-        uri: parsed.id.to_uri().unwrap_or_default(),
+        id: parsed.id.to_id(),
+        uri: parsed.id.to_uri(),
         name: parsed.name.clone(),
         images: images(portraits),
         popularity: Some(parsed.popularity.clamp(0, 100) as u8),
@@ -898,9 +897,7 @@ async fn entities<'a>(
     let mut request = BatchedEntityRequest::new();
     let mut asked = BTreeSet::new();
     for uri in uris {
-        let Ok(text) = uri.to_uri() else {
-            continue;
-        };
+        let text = uri.to_uri();
         if !asked.insert(text.clone()) {
             continue;
         }
