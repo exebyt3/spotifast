@@ -1,7 +1,7 @@
 [package]
 name = "spotifast"
 default-run = "spotifast"
-version = "0.12.0"
+version = "0.13.1"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -37,48 +37,53 @@ egui = "0.36"
 egui_extras = { version = "0.36", features = ["image", "svg"] }
 # The shared foundation of Spotifast, ZapFast, RekordFlash and TonePush
 # (crmne/fastframe). Every crate comes from the same revision; move them
-# together. For now a fork of v0.4.1's successor with two changes proposed
-# upstream: a headless shell that sleeps until woken, and the audio stream's
-# thread joining MMCSS on Windows. Back to a crmne/fastframe tag once a
-# release carries them.
-fastframe-text ={ git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
-fastframe-fonts = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
-fastframe-icons = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
-fastframe-theme = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
+# together.
+fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
+fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
+fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
+fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # Colour emoji in the platform's own style (Apple Color Emoji, Segoe UI
 # Emoji, the desktop's colour emoji font), in every text through its egui
 # plugin.
-fastframe-emoji = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
+fastframe-emoji = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # Catalogs compiled from PO files at build time (see build.rs) and the
 # system's preferred languages. No libintl or runtime catalog parsing.
-fastframe-i18n = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
+fastframe-i18n = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # The log file for bug reports and the panic log (env_logger underneath).
-fastframe-log = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
+fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # The tray item, so closing the window can keep the music playing:
 # StatusNotifier on Linux, the notification area on Windows, the menu bar
 # on macOS.
-fastframe-tray = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
+fastframe-tray = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # Keeps the app running without a window around eframe::run_native.
-fastframe-shell = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
+fastframe-shell = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # The macOS title-bar double-click setting (does nothing elsewhere).
-fastframe-macos = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
+fastframe-macos = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # Self-update from GitHub releases, on the reqwest client below.
-fastframe-update = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e", features = ["reqwest"] }
+fastframe-update = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1", features = ["reqwest"] }
+# Settings, the session, the history, caches and the credential markers
+# are replaced whole: a temporary file beside each, synced to the disk, then
+# moved over it (written through on Windows), so a crash never leaves half.
+fastframe-file = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
+# The device's power, session and network state: energy saver, battery,
+# display, lock, the internet's reach and cost, sleep and wake, and the App
+# Nap activity local playback holds on macOS.
+fastframe-power = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # The audio device stream: it pauses, so a paused player costs no CPU (#636),
 # follows the default output and reopens after a failure. Its cpal 0.18
 # cannot share a build with the cpal 0.16 of librespot's rodio backend (both
 # link ALSA), so that backend is left out.
-fastframe-audio = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
+fastframe-audio = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # The wheel step, the Linux touchpad scale and glide, and the axis a scroll
 # gesture holds.
-fastframe-scroll = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
+fastframe-scroll = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # One running copy per user: a lock and a private channel that a second
 # launch and the command line hand their requests to.
-fastframe-instance = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
+fastframe-instance = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # The desktop's media controls: MPRIS on Linux, the media overlay on
 # Windows, Now Playing on macOS. The media keys and those panels send
 # commands back, and closing the window keeps the music playing.
-fastframe-now-playing = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e" }
+fastframe-now-playing = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # Reading installed fonts for MilkDrop's overlays, the Winamp playlist's
 # pixel text, and the playlist face. skrifa is the parser epaint already
 # rasterizes with, and the version has to track epaint's or the binary
@@ -86,8 +91,10 @@ fastframe-now-playing = { git = "https://github.com/dennisgr7/fastframe", rev = 
 # to the few pages of each font that name it. fastframe-fonts uses both.
 skrifa = "0.44"
 memmap2 = "0.9"
-# bmp is for Winamp skins, whose bitmaps are BMP files.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
+# bmp is for Winamp skins, whose bitmaps are BMP files. webp is for cover
+# URLs: Spotify's CDN sometimes serves the same cover as WebP, and without
+# this every size of it fails to decode and the placeholder is drawn.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "webp"] }
 # Inflating the zip a Winamp skin comes as (src/skin/zip.rs). Already
 # compiled for reqwest's gzip support, so this adds no code to the build.
 flate2 = "1"
@@ -146,6 +153,17 @@ http = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "net", "io-util"] }
 sha1 = "0.10"
 sha2 = "0.10"
+# Spotify names a Cast device by the MD5 of its friendly name (`cast.rs`).
+md-5 = "0.10"
+# Cast v2 runs over TLS with a certificate from Google's device CA, which
+# needs a custom verifier (`cast.rs`). Already in the tree through reqwest.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The device then proves it is genuine with a certificate chain to Google's
+# Cast roots (`cast.rs`). ring adds the SHA-1 signatures older devices still
+# use, which rustls-webpki leaves out. Both are already in the tree through
+# rustls.
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+ring = "0.17"
 base64 = "0.22"
 # Native asynchronous file selection on macOS, Windows and Linux desktop portals.
 rfd = "0.17.2"
@@ -165,9 +183,11 @@ ctr = "0.9"
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 # The application menus and Dock menu (src/mac_menu.rs). "exception" lets
 # src/mac_touchbar_crash_guard.rs catch a specific AppKit Objective-C
-# exception instead of letting it abort the process.
+# exception instead of letting it abort the process. NSWorkspace and
+# NSAccessibility answer whether the user asked for less motion
+# (src/motion.rs).
 objc2 = { version = "0.6", features = ["exception"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSWindow", "NSView", "NSScreen", "NSColor", "NSImage", "NSImageView", "NSButton", "NSControl", "NSTrackingArea", "NSVisualEffectView", "NSTextField", "NSBezierPath", "NSFont", "NSAnimation", "NSAnimationContext"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSWindow", "NSView", "NSScreen", "NSColor", "NSImage", "NSImageView", "NSButton", "NSControl", "NSTrackingArea", "NSVisualEffectView", "NSTextField", "NSBezierPath", "NSFont", "NSAnimation", "NSAnimationContext", "NSWorkspace"] }
 # NSAppleEventManager and NSAppleEventDescriptor carry the Spotify links
 # macOS hands an app registered for the scheme (src/mac_links.rs), and
 # NSRunLoop has the delayed perform the title bar uses (src/window.rs).
@@ -175,10 +195,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = { version = "1.1", default-features = false }
-# Message loops, the taskbar thumbnail buttons and window styles. Power,
-# session and network state (src/power/windows.rs): power settings, sleep and
-# wake, the session lock, and the network's reach and cost.
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Power", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# Message loops, the taskbar thumbnail buttons and window styles.
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Reuses the zbus/Tokio stack already used for desktop integration.
@@ -188,6 +206,10 @@ librespot-playback = { version = "0.8", default-features = false, features = ["p
 # (src/appearance.rs). fastframe-now-playing's MPRIS already compiles this
 # version.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+# Whether the session is GNOME, and its window button layout and icon theme
+# read through the desktop portal (src/window.rs), which works inside a
+# Flatpak, where running gsettings does not.
+fastframe-desktop = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # Keeps the X11 mini player out of the taskbar with _NET_WM_STATE_SKIP_TASKBAR
 # (src/window.rs), which winit only offers on Windows. winit already
 # compiles this version.
@@ -196,7 +218,7 @@ x11rb = { version = "0.13", default-features = false }
 [build-dependencies]
 # Drops unfinished PO entries and compiles catalog text and gettext plural
 # expressions to Rust. Ordinary builds do not need gettext tools.
-fastframe-i18n = { git = "https://github.com/dennisgr7/fastframe", rev = "f7dc6fbe938e8a953509d110cdba036f537e5b7e", features = ["build"] }
+fastframe-i18n = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1", features = ["build"] }
 
 [dev-dependencies]
 # Checks that every catalog covers the template and keeps its placeholders.
@@ -276,25 +298,25 @@ winit = { git = "https://github.com/crmne/winit", rev = "ed7caa9023f10b397f5b6ec
 # which GitHub's windows-latest images no longer carry; the fork lets an
 # explicit CMAKE_GENERATOR win, and asks vcpkg for the target's architecture
 # so libprojectM links for Windows on ARM. Drop when upstream takes the change.
-projectm-sys = { git = "https://github.com/dennisgr7/projectm-rs", rev = "1ef6df1c20247a3a5800c625e46262330f93bbd6" }
+projectm-sys = { git = "https://github.com/crmne/projectm-rs", rev = "1ef6df1c20247a3a5800c625e46262330f93bbd6" }
 # hyper-proxy2's unreleased rustls 0.23 update plus our upstream provider
 # compatibility fix. Drop this fork when a release includes both changes.
 hyper-proxy2 = { git = "https://github.com/crmne/hyper-proxy2", rev = "efca4811371ddae81c06be168de54194938d70b1" }
-# librespot 0.8.0 plus the small patches Spotifast needs: queue controls,
-# normalisation-factor reporting for the visualisers, and a distinct event
-# when Spotify refuses an audio key, bounded socket setup with DNS address
-# fallback, an in-memory credential cache for platform storage, full
-# playback-state recovery after a session disconnect, the desktop platform
-# signature for Windows on ARM, and a volume set while the device is inactive.
-# Recovery is proposed upstream in librespot-org/librespot#1765 and the
-# volume in librespot-org/librespot#1770; the ARM signature answers
-# librespot-org/librespot#1737.
-# Every librespot crate comes from the
-# fork so one copy exists. Drop patches as upstream takes them.
-librespot-audio = { git = "https://github.com/crmne/librespot", rev = "23fc42cff37848e51f0d8eaefad1a93941b71e59" }
-librespot-connect = { git = "https://github.com/crmne/librespot", rev = "23fc42cff37848e51f0d8eaefad1a93941b71e59" }
-librespot-core = { git = "https://github.com/crmne/librespot", rev = "23fc42cff37848e51f0d8eaefad1a93941b71e59" }
-librespot-metadata = { git = "https://github.com/crmne/librespot", rev = "23fc42cff37848e51f0d8eaefad1a93941b71e59" }
-librespot-oauth = { git = "https://github.com/crmne/librespot", rev = "23fc42cff37848e51f0d8eaefad1a93941b71e59" }
-librespot-playback = { git = "https://github.com/crmne/librespot", rev = "23fc42cff37848e51f0d8eaefad1a93941b71e59" }
-librespot-protocol = { git = "https://github.com/crmne/librespot", rev = "23fc42cff37848e51f0d8eaefad1a93941b71e59" }
+# crmne/librespot spotifast-dev: librespot's dev branch, which already has
+# the queue controls and the Windows on ARM login, plus the patches it has
+# not merged yet. Each is open as a librespot-org/librespot pull request:
+# normalisation-factor reporting for the visualisers (#1798), a stop and a
+# distinct event when Spotify refuses an audio key (#1799), socket setup
+# inside the access-point timeout (#1800), ranged playlist reads (#1801), an
+# in-memory credential cache for platform storage (#1802), bounded socket
+# setup that races IPv6 and IPv4 (#1803), playback recovery after a session
+# disconnect (#1765), and a volume set while the device is inactive (#1770).
+# Every librespot crate comes from the fork so one copy exists. Drop each
+# patch once upstream merges it.
+librespot-audio = { git = "https://github.com/crmne/librespot", rev = "4118319a671f13cb3d85c7a870048216e75ee86e" }
+librespot-connect = { git = "https://github.com/crmne/librespot", rev = "4118319a671f13cb3d85c7a870048216e75ee86e" }
+librespot-core = { git = "https://github.com/crmne/librespot", rev = "4118319a671f13cb3d85c7a870048216e75ee86e" }
+librespot-metadata = { git = "https://github.com/crmne/librespot", rev = "4118319a671f13cb3d85c7a870048216e75ee86e" }
+librespot-oauth = { git = "https://github.com/crmne/librespot", rev = "4118319a671f13cb3d85c7a870048216e75ee86e" }
+librespot-playback = { git = "https://github.com/crmne/librespot", rev = "4118319a671f13cb3d85c7a870048216e75ee86e" }
+librespot-protocol = { git = "https://github.com/crmne/librespot", rev = "4118319a671f13cb3d85c7a870048216e75ee86e" }

@@ -1,13 +1,13 @@
-name: Fork release (Windows)
+name: Fork release
 
-# The fork's releases: the Linux build comes from a Fedora machine, this
-# adds the Windows x64 zip and installer to the release named by `tag`.
+# The fork's releases: adds the Linux x64 tarball and the Windows x64 zip and
+# installer to the release named by `tag`.
 # release.yml stays upstream's: it needs signing keys this fork does not have.
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to attach the Windows build to
+        description: Existing release tag to attach the builds to
         required: true
 
 permissions:
@@ -17,6 +17,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    env:
+      CMAKE_GENERATOR: Ninja
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libpulse-dev libxkbcommon-dev \
+            libwayland-dev libgl1-mesa-dev cmake libclang-dev ninja-build
+      - run: cargo build --release
+
+      - name: Package
+        run: |
+          name="spotifast-${TAG}-linux-x64"
+          mkdir -p "dist/$name"
+          cp target/release/spotifast README.md LICENSE \
+            packaging/spotifast-portable.txt "dist/$name/"
+          cp --parents packaging/applications/spotifast.desktop packaging/icons/spotifast.svg "dist/$name/"
+          cd dist && tar czf "$name.tar.gz" "$name"
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/*.tar.gz --clobber --repo "$GITHUB_REPOSITORY"
+
   windows:
     runs-on: windows-latest
     env:

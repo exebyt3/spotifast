@@ -12,6 +12,7 @@ pub mod library;
 pub mod login;
 mod lyrics;
 pub mod player_bar;
+mod prerelease;
 pub mod queue;
 pub mod radio;
 pub mod search;
@@ -57,7 +58,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 ui.max_rect().min,
                 vec2(
                     ui.max_rect().width(),
-                    theme::TOP_BAR_HEIGHT + theme::titlebar_inset(ui.ctx()),
+                    theme::top_bar_height() + theme::titlebar_inset(ui.ctx()),
                 ),
             ),
         );
@@ -175,9 +176,6 @@ pub(crate) fn panel_width_chosen(ctx: &Context, id: &str, fit: &PanelFit) -> boo
     !fit.yielding || ctx.is_being_dragged(Id::new(id).with("__resize"))
 }
 
-/// Spotify artwork width used by the library grid and its page preview.
-const GRID_ART_TARGET_WIDTH: u32 = 300;
-
 /// Keeps the most recent loading preview of each metadata type available to
 /// the loaded hero as an artwork fallback. The fixed typed slot bounds this to
 /// one playlist, album, artist, and show instead of scanning known metadata on
@@ -241,7 +239,12 @@ fn page_tint(app: &mut App) -> Option<Color32> {
             .and_then(|show| pick_image(&show.images, 64))
             .map(str::to_string),
         Page::Radio(seed) => pick_image(&app.radio_images(seed), 64).map(str::to_string),
-        Page::LikedSongs => return Some(Color32::from_rgb(0x50, 0x38, 0xc8)),
+        Page::LikedSongs => {
+            return app
+                .settings
+                .accent_from_art
+                .then_some(Color32::from_rgb(0x50, 0x38, 0xc8));
+        }
         _ => None,
     };
     if !app.settings.accent_from_art && image.is_some() {
@@ -378,6 +381,11 @@ const WINDOW_RESIZE_BORDER: f32 = 5.0;
 const LINUX_CONTROLS_MARGIN: f32 = 14.0;
 const WINDOW_RESIZE_CORNER: f32 = 10.0;
 const WINDOWS_WINDOW_CONTROLS_WIDTH: f32 = 3.0 * 36.0 + WINDOW_RESIZE_BORDER;
+/// The caption row: the custom Windows header's height, or Linux's buttons
+/// with their margin.
+#[cfg(not(target_os = "linux"))]
+const WINDOWS_WINDOW_CONTROLS_HEIGHT: f32 = theme::CUSTOM_TOP_BAR_HEIGHT;
+#[cfg(target_os = "linux")]
 const WINDOWS_WINDOW_CONTROLS_HEIGHT: f32 = 36.0 + WINDOW_RESIZE_BORDER;
 // The 760-point minimum with the default 250-point sidebar leaves 510 points.
 const WINDOWS_MIN_INLINE_TOPBAR_WIDTH: f32 = 510.0 + WINDOWS_WINDOW_CONTROLS_WIDTH;
@@ -493,10 +501,15 @@ pub fn window_controls(ui: &mut egui::Ui, palette: &theme::Palette, locale: crat
         ]
         .as_slice(),
     )];
-    let (margin, spacing) = if cfg!(target_os = "linux") {
-        (14.0, 8.0)
+    // Windows centres its 36-point buttons in the custom header's height.
+    let (margin, top, spacing) = if cfg!(target_os = "linux") {
+        (14.0, 14.0, 8.0)
     } else {
-        (WINDOW_RESIZE_BORDER, 0.0)
+        (
+            WINDOW_RESIZE_BORDER,
+            (WINDOWS_WINDOW_CONTROLS_HEIGHT - 36.0) / 2.0 + 2.0,
+            0.0,
+        )
     };
     for (right, buttons) in groups {
         if buttons.is_empty() {
@@ -513,7 +526,7 @@ pub fn window_controls(ui: &mut egui::Ui, palette: &theme::Palette, locale: crat
             } else {
                 Align2::LEFT_TOP
             },
-            vec2(if right { -margin } else { margin }, margin),
+            vec2(if right { -margin } else { margin }, top),
         )
         .order(egui::Order::Foreground)
         .show(ui.ctx(), |ui| {
@@ -570,22 +583,25 @@ pub fn window_controls(ui: &mut egui::Ui, palette: &theme::Palette, locale: crat
                     let image = icon
                         .image(palette.secondary, 14.0)
                         .alt_text(tooltip.as_ref());
+                    #[cfg(not(target_os = "linux"))]
+                    let close = matches!(button, WindowButton::Close);
                     let button = egui::Button::image(image).frame_when_inactive(false);
                     #[cfg(target_os = "linux")]
-                    let button = button
-                        .frame_when_inactive(true)
-                        .fill(palette.surface_hover)
-                        .corner_radius(egui::CornerRadius::same(14));
+                    let response = ui.add_sized(
+                        egui::Vec2::splat(28.0),
+                        button
+                            .frame_when_inactive(true)
+                            .fill(palette.surface_hover)
+                            .corner_radius(egui::CornerRadius::same(14)),
+                    );
+                    #[cfg(not(target_os = "linux"))]
                     let response = ui
-                        .add_sized(
-                            egui::Vec2::splat(if cfg!(target_os = "linux") {
-                                28.0
-                            } else {
-                                36.0
-                            }),
-                            button,
-                        )
-                        .on_hover_text(tooltip.as_ref());
+                        .scope(|ui| {
+                            caption_feedback(ui, close);
+                            ui.add_sized(egui::Vec2::splat(36.0), button)
+                        })
+                        .inner;
+                    let response = response.on_hover_text(tooltip.as_ref());
                     if response.clicked() {
                         ui.ctx().send_viewport_cmd(command);
                     }
@@ -593,6 +609,30 @@ pub fn window_controls(ui: &mut egui::Ui, palette: &theme::Palette, locale: crat
             });
         });
     }
+}
+
+/// Windows' caption feedback: a light wash over Minimize and Maximize while
+/// hovered, red under Close, each dimmer while pressed.
+#[cfg(not(target_os = "linux"))]
+fn caption_feedback(ui: &mut egui::Ui, close: bool) {
+    let (hover, pressed) = if close {
+        (
+            egui::Color32::from_rgb(232, 17, 35),
+            egui::Color32::from_rgb(174, 13, 26),
+        )
+    } else {
+        (
+            egui::Color32::from_white_alpha(55),
+            egui::Color32::from_white_alpha(32),
+        )
+    };
+    let visuals = &mut ui.style_mut().visuals.widgets;
+    visuals.hovered.bg_fill = hover;
+    visuals.hovered.weak_bg_fill = hover;
+    visuals.hovered.bg_stroke = egui::Stroke::NONE;
+    visuals.active.bg_fill = pressed;
+    visuals.active.weak_bg_fill = pressed;
+    visuals.active.bg_stroke = egui::Stroke::NONE;
 }
 
 fn window_resize(ui: &mut egui::Ui) {
