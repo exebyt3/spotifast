@@ -8672,7 +8672,8 @@ mod authorization_tests {
             generation: 1,
         });
         let generation = worker.album_type_lookup.session_generation;
-        worker.on_engine_connected(generation, None, Some("Spotify refused".into()));
+        let attempt = worker.engine_attempt;
+        worker.on_engine_connected(generation, None, Some("Spotify refused".into()), attempt);
         assert!(worker.parked.is_empty());
     }
 
@@ -8738,6 +8739,7 @@ mod session_tests {
                 &crate::made_for_you::MadeForYou::new(crate::http::Http::default()),
                 &crate::sonos::Controller::default(),
                 None,
+                &crate::http::Http::default(),
                 &background_session,
                 ApiRequest::TopArtists { generation: 7 },
             ),
@@ -8767,7 +8769,7 @@ mod session_tests {
             Some(SessionRead::ArtistTop { id: "artist1" })
         );
         assert!(
-            matches!(session_response(&request, SessionAnswer::ArtistTop(Ok(Vec::new()))),
+            matches!(session_response(&request, SessionAnswer::ArtistTop(Ok(Vec::new())), None),
             Some(ApiResponse::ArtistTopTracks { id, result: Ok(tracks) }) if id == "artist1" && tracks.is_empty())
         );
         let transient = settle(Err::<Vec<Track>, Failure>(Failure::Retry(anyhow::anyhow!(
@@ -8785,7 +8787,7 @@ mod session_tests {
         )))
         .unwrap();
         assert!(matches!(
-            session_response(&request, SessionAnswer::ArtistTop(refused)),
+            session_response(&request, SessionAnswer::ArtistTop(refused), None),
             Some(ApiResponse::ArtistTopTracks {
                 result: Err(ApiError::Status { status: 403, .. }),
                 ..
