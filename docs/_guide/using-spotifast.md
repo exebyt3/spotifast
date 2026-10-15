@@ -345,6 +345,8 @@ dates come last.
 **Spotify custom order** follows your playlist order and folders from Spotify.
 Set up playback on this computer to load that order. Your playlists stay
 visible while it loads, and Spotifast remembers the last order for your account.
+When you rearrange your library in another Spotify app, Spotifast picks up the
+new order when you switch back to it.
 Items you pin in Spotifast remain at the top, including items from a closed
 folder. Sorting or dragging Library items changes their order only in
 Spotifast; it does not rearrange your Spotify library.
@@ -380,7 +382,7 @@ song plays on this computer. It is off by default. Clicking the player
 bar's empty space switches it, as Winamp's visualizer did: off, then
 Spectrum, then Waveform, then off again. **Frame rate** in **Settings >
 Appearance** sets how often it and the mini player's analyser draw: 30, 60
-(the default), your screen's rate once MilkDrop has seen it, or Uncapped,
+(the default), the rate of the screen showing the window, or Uncapped,
 which follows the display. They draw at half that rate while Spotifast's
 window is out of focus, at most 30 frames a second while the system saves
 energy, and not at all while nobody can see the window: minimised, in the

@@ -1184,7 +1184,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         ui,
                         &palette,
                         locale,
-                        app.settings.milkdrop_screen_hz,
+                        app.visualiser_screen_hz(),
                         app.settings.visualizer_fps,
                     ) {
                         app.settings.visualizer_fps = rate;
@@ -1583,7 +1583,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
 
     let presets_folder = app.dirs.milkdrop_dir();
-    app.winamp.presets.refresh(&presets_folder);
+    app.winamp
+        .presets
+        .refresh(&presets_folder, Some(ui.ctx().clone()));
     let count = app.winamp.presets.count();
     let screen_hz = app.settings.milkdrop_screen_hz;
     let milkdrop_window = gettext(locale, "MilkDrop window");
@@ -1639,7 +1641,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         RowText::new(
             gettext(locale, "Frame rate"),
             match screen_hz {
-                0 => gettext(
+                hz if !crate::milkdrop::is_screen_rate(hz) => gettext(
                     locale,
                     "Lower rates use fewer resources. Uncapped draws as fast as possible.",
                 ),
