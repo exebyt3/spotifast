@@ -3593,19 +3593,6 @@ impl Worker {
                         self.reconnects.push(now);
                         self.resume_engine();
                     }
-                } else if let Some(message) =
-                    error.as_deref().filter(|message| connect_failure_is_transient(message))
-                {
-                    // Spotify unreachable for a moment, as while a VPN switches
-                    // profile: try again, within the reconnect limit, with the
-                    // playback to resume kept, instead of leaving playback dead
-                    // until the user re-enables it.
-                    log::info!("engine connect failed ({message}); trying again in 5 s");
-                    let commands = self.commands.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        let _ = commands.send(Command::Reconnect);
-                    });
                 } else if authorize_if_rejected && is_rejected_grant(error.as_deref()) {
                     // The user asked for playback and the saved grant no
                     // longer works: ask Spotify for a new one.
@@ -4365,11 +4352,6 @@ impl Worker {
             }
         });
     }
-}
-
-/// A failure to reach Spotify at all, one that a moment's wait can cure.
-fn connect_failure_is_transient(message: &str) -> bool {
-    message == CONNECT_TIMED_OUT || message.starts_with("Couldn't reach Spotify")
 }
 
 fn friendly_connect_error(error: &anyhow::Error) -> String {
