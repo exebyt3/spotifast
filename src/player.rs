@@ -190,6 +190,10 @@ pub struct LocalState {
     /// `Paused` that brings the position counts as a seek for media
     /// controls, which would otherwise count on past the end (#587).
     pub replay_pending: bool,
+    /// The URI the last `Loading` asked for. librespot plays an available
+    /// alternative of a song the market lacks and reports that URI instead;
+    /// the asked one is what the playlist, the queue and Liked Songs hold.
+    pub requested_uri: Option<String>,
 }
 
 /// What local playback was doing when its session ended, so the engine
@@ -892,7 +896,12 @@ fn apply_event(state: &mut LocalState, event: PlayerEvent) -> bool {
             changed |= set(&mut state.position_at, None);
             changed
         }
-        PlayerEvent::Loading { position_ms, .. } => {
+        PlayerEvent::Loading {
+            track_id,
+            position_ms,
+            ..
+        } => {
+            state.requested_uri = Some(track_id.to_uri());
             let mut changed = if state.playback == Playback::Stopped {
                 set(&mut state.playback, Playback::Loading)
             } else {
@@ -936,7 +945,10 @@ fn apply_event(state: &mut LocalState, event: PlayerEvent) -> bool {
             true
         }
         PlayerEvent::TrackChanged { audio_item } => {
-            let track = local_track(&audio_item);
+            let mut track = local_track(&audio_item);
+            if let Some(requested) = state.requested_uri.take() {
+                track.uri = requested;
+            }
             state.replay_pending = state
                 .track
                 .as_ref()
@@ -1447,6 +1459,37 @@ mod tests {
                 assert_eq!(state.track_sequence, sequence);
             }
         }
+    }
+
+    /// A song the market lacks plays as one of its alternatives: the track
+    /// keeps the URI that was asked for, so it still reads as liked.
+    #[test]
+    fn an_alternative_keeps_the_uri_that_was_asked_for() {
+        let mut state = LocalState::default();
+        let asked = SpotifyUri::from_uri("spotify:track:4uLU6hMCjMI75M1A2tKUQC").unwrap();
+        apply_event(
+            &mut state,
+            PlayerEvent::Loading {
+                play_request_id: 1,
+                track_id: asked.clone(),
+                position_ms: 0,
+            },
+        );
+        apply_event(
+            &mut state,
+            PlayerEvent::TrackChanged {
+                audio_item: Box::new(interlude()),
+            },
+        );
+        assert_eq!(state.track.as_ref().unwrap().uri, asked.to_uri());
+        // A track that starts without a load of its own keeps librespot's URI.
+        apply_event(
+            &mut state,
+            PlayerEvent::TrackChanged {
+                audio_item: Box::new(interlude()),
+            },
+        );
+        assert_eq!(state.track.as_ref().unwrap().uri, uri().to_uri());
     }
 
     /// A track on repeat plays again with the same metadata, so only a
