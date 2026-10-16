@@ -1409,6 +1409,19 @@ impl App {
         self.now_playing().map(|now| now.uri)
     }
 
+    /// Whether `uri` is the current track, also when the engine plays
+    /// another market's URI of the same recording: librespot swaps an
+    /// unavailable playlist track for an available alternative.
+    pub fn is_current_track(&self, uri: &str) -> bool {
+        self.current_track_uri().is_some_and(|current| {
+            current == uri
+                || self
+                    .track_recordings
+                    .get(&current)
+                    .is_some_and(|key| self.track_recordings.get(uri) == Some(key))
+        })
+    }
+
     /// Shows a user-requested track until the responsible playback surface
     /// has had a chance to report what really started.
     fn expect_track(&mut self, uri: String, position_ms: u32) {
@@ -22864,6 +22877,27 @@ mod tests {
 
         assert_eq!(app.is_saved(playing_uri), Some(true));
         assert_eq!(app.saved_toggle_targets(playing_uri), vec![saved_uri]);
+    }
+
+    #[test]
+    fn a_playlist_row_is_current_while_its_market_alternative_plays() {
+        let mut app = headless_app();
+        let recording = |uri: &str, isrc: &str| Track {
+            uri: uri.into(),
+            external_ids: crate::api::models::ExternalIds {
+                isrc: Some(isrc.into()),
+            },
+            ..Default::default()
+        };
+        let (listed, playing) = ("spotify:track:listed", "spotify:track:alternative");
+        app.remember_track_recording(&recording(listed, "AAA"));
+        app.remember_track_recording(&recording("spotify:track:other", "BBB"));
+        app.expect_track(playing.into(), 0);
+        assert!(!app.is_current_track(listed));
+        app.remember_track_recording(&recording(playing, "AAA"));
+        assert!(app.is_current_track(listed));
+        assert!(app.is_current_track(playing));
+        assert!(!app.is_current_track("spotify:track:other"));
     }
 
     #[test]
