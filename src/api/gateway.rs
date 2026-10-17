@@ -107,12 +107,13 @@ pub enum Operation {
 /// list and the liked songs among them: it has no quota at all, and it reads what a personal
 /// app is refused. The account's devices, playback and queue are what
 /// Spotify pushes to it, and the commands to the account's other devices
-/// go out over the same channel.
+/// go out over the same channel. Songs are added to a playlist over the
+/// session whenever the shared app would have taken the write.
 fn session_serves(operation: Operation, personal_ready: bool) -> bool {
     match operation {
-        Operation::PlaylistMetadata(_) | Operation::PlaylistItems(_) => {
-            plan(operation, personal_ready) == ApiSource::Shared
-        }
+        Operation::PlaylistMetadata(_)
+        | Operation::PlaylistItems(_)
+        | Operation::PlaylistMutation(_) => plan(operation, personal_ready) == ApiSource::Shared,
         Operation::ArtistTopTracks
         | Operation::Playback
         | Operation::Catalog
@@ -533,6 +534,8 @@ mod tests {
                 Operation::PlaylistItems(PlaylistAccess::Collaborative),
                 false,
             ),
+            (Operation::PlaylistMutation(PlaylistAccess::Owned), false),
+            (Operation::PlaylistMutation(PlaylistAccess::External), true),
         ] {
             assert!(session_serves(operation, personal), "{operation:?}");
         }
@@ -542,7 +545,7 @@ mod tests {
                 Operation::PlaylistItems(PlaylistAccess::Collaborative),
                 true,
             ),
-            (Operation::PlaylistMutation(PlaylistAccess::External), true),
+            (Operation::PlaylistMutation(PlaylistAccess::Owned), true),
             (Operation::PlaylistCreation, false),
         ] {
             assert!(!session_serves(operation, personal), "{operation:?}");

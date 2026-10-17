@@ -5371,6 +5371,9 @@ async fn over_session(
             SessionRead::Duplicates { id, uris } => SessionAnswer::Duplicates(settle(
                 session_reads::duplicates(session, id, &uris).await,
             )?),
+            SessionRead::AddItems { id, uris, position } => SessionAnswer::Snapshot(settle(
+                session_reads::add_items(session, id, uris, position).await,
+            )?),
             SessionRead::Devices => {
                 let cluster = engine.cluster().fresh()?;
                 SessionAnswer::Devices(Ok(crate::connect_state::devices(&cluster)))
@@ -5403,18 +5406,22 @@ async fn over_session(
             )?),
         })
     };
-    let command = matches!(session_read(request), Some(SessionRead::Command { .. }));
     let Ok(answer) = tokio::time::timeout(SESSION_READ_TIMEOUT, read).await else {
-        if command {
-            // It may have gone out; asking the Web API too could send it twice.
-            let unconfirmed = SessionAnswer::Command(Err(ApiError::Status {
+        // A write may have gone out; asking the Web API too could send it twice.
+        let unconfirmed = match session_read(request) {
+            Some(SessionRead::Command { .. }) => SessionAnswer::Command(Err(ApiError::Status {
                 status: 504,
                 message: "Spotify did not confirm the command".into(),
-            }));
-            return session_response(request, unconfirmed, account_id);
-        }
-        log::debug!("session read timed out; asking the Web API");
-        return None;
+            })),
+            Some(SessionRead::AddItems { .. }) => {
+                SessionAnswer::Snapshot(Err(session_reads::not_confirmed()))
+            }
+            _ => {
+                log::debug!("session read timed out; asking the Web API");
+                return None;
+            }
+        };
+        return session_response(request, unconfirmed, account_id);
     };
     session_response(request, answer?, account_id)
 }
@@ -5455,6 +5462,12 @@ enum SessionRead<'a> {
     ShowEpisodes { id: &'a str, offset: u32 },
     HomeEpisodes { shows: &'a [Show] },
     Duplicates { id: &'a str, uris: Vec<String> },
+    /// Songs added to a playlist; `None` appends.
+    AddItems {
+        id: &'a str,
+        uris: &'a [String],
+        position: Option<u32>,
+    },
     Devices,
     PlaybackState,
     Queue,
@@ -5519,6 +5532,16 @@ fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
         } => SessionRead::Duplicates {
             id: playlist_id,
             uris: items.iter().map(|item| item.uri().to_string()).collect(),
+        },
+        ApiRequest::AddToPlaylist {
+            playlist_id,
+            uris,
+            position,
+            ..
+        } => SessionRead::AddItems {
+            id: playlist_id,
+            uris,
+            position: *position,
         },
         ApiRequest::Devices => SessionRead::Devices,
         ApiRequest::PlaybackState { .. } => SessionRead::PlaybackState,
@@ -5588,6 +5611,7 @@ enum SessionAnswer {
     Episodes(ApiResult<Page<Episode>>),
     HomeEpisodes(ApiResult<Vec<(Show, Vec<Episode>)>>),
     Duplicates(ApiResult<Vec<String>>),
+    Snapshot(ApiResult<Option<String>>),
     Devices(ApiResult<Vec<Device>>),
     Playback(ApiResult<Option<PlaybackState>>),
     Queue(ApiResult<Queue>),
@@ -5819,6 +5843,18 @@ fn session_response(
             playlist_name: playlist_name.clone(),
             items: items.clone(),
             position: *position,
+        },
+        (
+            ApiRequest::AddToPlaylist {
+                playlist_id,
+                playlist_name,
+                ..
+            },
+            SessionAnswer::Snapshot(result),
+        ) => ApiResponse::PlaylistItemsChanged {
+            result,
+            id: playlist_id.clone(),
+            message: format!("Added to {playlist_name}"),
         },
         _ => return None,
     })
@@ -8834,6 +8870,21 @@ mod session_tests {
             Some(SessionRead::Duplicates {
                 id: "pl1",
                 uris: Vec::new()
+            })
+        );
+        let uris = vec!["spotify:track:a".to_string()];
+        let add = ApiRequest::AddToPlaylist {
+            playlist_id: "pl1".into(),
+            playlist_name: "Mine".into(),
+            uris: uris.clone(),
+            position: Some(2),
+        };
+        assert_eq!(
+            session_read(&add),
+            Some(SessionRead::AddItems {
+                id: "pl1",
+                uris: &uris,
+                position: Some(2),
             })
         );
         assert_eq!(session_read(&ApiRequest::Me), None);

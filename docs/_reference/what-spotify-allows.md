@@ -64,6 +64,10 @@ clients. Spotifast uses its session for:
   account, and a newer Web API answer takes precedence over an older disk
   cache. A song the session reads first has unknown availability; if it cannot
   play, it is skipped when reached, as it would be anywhere else.
+- **Adding songs to a playlist** when the shared app would have taken the
+  write, through the change request Spotify's own clients send. It spends
+  none of the shared app's quota. A refused change still goes to the Web API;
+  a change Spotify did not answer is reported, not sent again.
 - **Library playlists the Web API lists blank.** The library list gives
   some of Spotify's own playlists, "This Is" ones among them, no name,
   cover, description, or songs. Spotifast reads each one's header over the

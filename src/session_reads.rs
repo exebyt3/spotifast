@@ -791,6 +791,119 @@ pub async fn duplicates(
         .collect())
 }
 
+/// Adds songs to a playlist the way Spotify's own clients do, so the write
+/// spends none of the Web API's quota. `None` for `position` appends. The
+/// answer is the playlist's new snapshot, as the Web API would give it.
+pub async fn add_items(
+    session: &Session,
+    id: &str,
+    uris: &[String],
+    position: Option<u32>,
+) -> Result<Option<String>, Failure> {
+    use librespot_protocol::playlist4_external::SelectedListContent;
+    let base = window(session, id, 0, 0).await?.revision;
+    let changes = add_changes(
+        base,
+        uris,
+        position,
+        &session.username(),
+        jiff::Timestamp::now().as_millisecond(),
+    );
+    let reply = session
+        .spclient()
+        .request_with_protobuf(
+            &reqwest::Method::POST,
+            &format!("/playlist/v2/playlist/{id}/changes"),
+            None,
+            &changes,
+        )
+        .await
+        .map_err(unconfirmed)?;
+    let content = SelectedListContent::parse_from_bytes(&reply).ok();
+    Ok(content
+        .and_then(|content| {
+            content
+                .resulting_revisions
+                .last()
+                .cloned()
+                .or(content.revision)
+        })
+        .filter(|revision| !revision.is_empty())
+        .map(|revision| snapshot(&revision)))
+}
+
+/// One delta adding `uris` on top of the `base` revision it was made
+/// against, dated `now` in milliseconds.
+fn add_changes(
+    base: Vec<u8>,
+    uris: &[String],
+    position: Option<u32>,
+    user: &str,
+    now: i64,
+) -> librespot_protocol::playlist4_external::ListChanges {
+    use librespot_protocol::playlist4_external::{
+        Add, ChangeInfo, Delta, Item, ItemAttributes, ListChanges, Op, op::Kind,
+    };
+    use protobuf::MessageField;
+    let mut add = Add::new();
+    add.items = uris
+        .iter()
+        .map(|uri| {
+            let mut attributes = ItemAttributes::new();
+            attributes.set_timestamp(now);
+            let mut item = Item::new();
+            item.set_uri(uri.clone());
+            item.attributes = MessageField::some(attributes);
+            item
+        })
+        .collect();
+    match position {
+        Some(index) => add.set_from_index(i32::try_from(index).unwrap_or(i32::MAX)),
+        None => add.set_add_last(true),
+    }
+    let mut op = Op::new();
+    op.set_kind(Kind::ADD);
+    op.add = MessageField::some(add);
+    let mut info = ChangeInfo::new();
+    info.set_user(user.to_string());
+    info.set_timestamp(now);
+    let mut delta = Delta::new();
+    delta.set_base_version(base.clone());
+    delta.ops.push(op);
+    delta.info = MessageField::some(info);
+    let mut changes = ListChanges::new();
+    changes.set_base_revision(base);
+    changes.deltas.push(delta);
+    changes.set_want_resulting_revisions(true);
+    changes
+}
+
+/// How a playlist write failed. A refusal means Spotify did not apply it,
+/// so the Web API may still try; a lost answer may hide a write that
+/// landed, and sending it again could add the songs twice.
+fn unconfirmed(error: librespot_core::Error) -> Failure {
+    match error.kind {
+        ErrorKind::NotFound | ErrorKind::PermissionDenied => refused(error),
+        ErrorKind::InvalidArgument
+        | ErrorKind::FailedPrecondition
+        | ErrorKind::Unauthenticated
+        | ErrorKind::ResourceExhausted
+        | ErrorKind::Unimplemented => error.into(),
+        _ => {
+            log::warn!("playlist change over the session got no answer: {error}");
+            Failure::Definitive(not_confirmed())
+        }
+    }
+}
+
+/// The error a write gets when Spotify may or may not have applied it.
+pub fn not_confirmed() -> ApiError {
+    ApiError::Status {
+        status: 504,
+        message: "Spotify did not confirm the change".into(),
+    }
+}
+
 async fn album_message(session: &Session, id: &str) -> Result<AlbumMessage, Failure> {
     let uri = SpotifyUri::Album {
         id: SpotifyId::from_base62(id)?,
@@ -1426,6 +1539,34 @@ fn iso8601(timestamp_ms: i64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_added_song_goes_on_top_of_the_revision_it_was_made_against() {
+        use librespot_protocol::playlist4_external::op::Kind;
+        let uris = vec!["spotify:track:a".to_string(), "spotify:track:b".to_string()];
+        let appended = super::add_changes(vec![0, 0, 0, 7], &uris, None, "me", 1_000);
+        assert_eq!(appended.base_revision(), [0, 0, 0, 7]);
+        assert!(appended.want_resulting_revisions());
+        let [delta] = appended.deltas.as_slice() else {
+            panic!("one delta");
+        };
+        assert_eq!(delta.base_version(), [0, 0, 0, 7]);
+        assert_eq!(delta.info.user(), "me");
+        let [op] = delta.ops.as_slice() else {
+            panic!("one op");
+        };
+        assert_eq!(op.kind(), Kind::ADD);
+        assert!(op.add.add_last());
+        assert!(!op.add.has_from_index());
+        let added: Vec<&str> = op.add.items.iter().map(|item| item.uri()).collect();
+        assert_eq!(added, ["spotify:track:a", "spotify:track:b"]);
+        assert_eq!(op.add.items[0].attributes.timestamp(), 1_000);
+
+        let inserted = super::add_changes(Vec::new(), &uris, Some(3), "me", 1_000);
+        let add = &inserted.deltas[0].ops[0].add;
+        assert_eq!(add.from_index(), 3);
+        assert!(!add.add_last());
+    }
 
     #[test]
     fn a_public_profile_names_the_account() {
