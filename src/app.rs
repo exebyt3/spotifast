@@ -2709,7 +2709,7 @@ impl App {
             &self.local,
             &state,
         ) {
-            log::info!("the list ended; playing what Spotify follows {seed} with");
+            log::info!("playback ended; playing what Spotify follows {seed} with");
             self.local_list = None;
             self.backend.player(PlayerCommand::Load(LoadSpec {
                 context_uri: Some(seed),
@@ -11901,7 +11901,9 @@ fn local_load(request: &PlayRequest, shuffle: bool) -> LoadSpec {
     }
 }
 
-/// Returns the final track as the autoplay seed when a plain list ends.
+/// Returns the song that ended as the autoplay seed when playback stops at
+/// its end with nothing to follow: the last song of a plain list, or a song
+/// of a context that librespot's own autoplay did not carry on from.
 fn autoplay_seed(
     list: Option<&[String]>,
     autoplay: bool,
@@ -11916,7 +11918,12 @@ fn autoplay_seed(
         return None;
     }
     let track = before.track.as_ref()?;
-    if list?.last() != Some(&track.uri) || track.duration_ms == 0 {
+    let ended = match list {
+        Some(list) => list.last() == Some(&track.uri),
+        // Spotify has no autoplay for podcasts.
+        None => track.uri.contains(":track:"),
+    };
+    if !ended || track.duration_ms == 0 {
         return None;
     }
     let near_end = before.position_now() + 3_000 >= track.duration_ms;
@@ -25655,8 +25662,9 @@ mod tests {
         assert_eq!(episode.uris.len(), 1);
     }
 
-    /// A plain list that plays out seeds autoplay with its last song; a
-    /// stop anywhere else, a dropped session, or autoplay off does not.
+    /// A plain list that plays out seeds autoplay with its last song, and a
+    /// context that stops at a song's end with that song; a stop anywhere
+    /// else, a podcast, a dropped session, or autoplay off does not.
     #[test]
     fn a_list_that_ends_seeds_autoplay_with_its_last_song() {
         let track = |uri: &str| {
@@ -25685,12 +25693,22 @@ mod tests {
             Some("spotify:track:last")
         );
         assert_eq!(autoplay_seed(Some(&list), false, &playing, &stopped), None);
-        assert_eq!(autoplay_seed(None, true, &playing, &stopped), None);
+        assert_eq!(
+            autoplay_seed(None, true, &playing, &stopped).as_deref(),
+            Some("spotify:track:last"),
+            "a context librespot did not carry on from"
+        );
+        let episode = LocalState {
+            track: track("spotify:episode:e"),
+            ..playing.clone()
+        };
+        assert_eq!(autoplay_seed(None, true, &episode, &stopped), None);
         let mid_song = LocalState {
             position_ms: 60_000,
             ..playing.clone()
         };
         assert_eq!(autoplay_seed(Some(&list), true, &mid_song, &stopped), None);
+        assert_eq!(autoplay_seed(None, true, &mid_song, &stopped), None);
         let not_last = LocalState {
             track: track("spotify:track:first"),
             ..playing.clone()
