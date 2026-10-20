@@ -261,8 +261,34 @@ pub struct LoadSpec {
 /// replacement for an audio-settings change still uses a track pickup.
 #[derive(Clone, Debug)]
 pub enum PlaybackResume {
-    Session(Arc<librespot_connect::PlaybackSnapshot>),
+    /// A dropped session's playback, picked up at `position_ms`.
+    Session {
+        snapshot: Arc<librespot_connect::PlaybackSnapshot>,
+        position_ms: u32,
+    },
     Track(LoadSpec),
+}
+
+impl PlaybackResume {
+    /// The same playback `elapsed` further on, if it was playing: the
+    /// dropped session's player kept going while the new session came up.
+    pub fn played_on(self, elapsed: Duration) -> Self {
+        let elapsed_ms = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
+        match self {
+            Self::Session {
+                snapshot,
+                position_ms,
+            } if snapshot.playing() => Self::Session {
+                snapshot,
+                position_ms: position_ms.saturating_add(elapsed_ms),
+            },
+            Self::Track(mut spec) if spec.play => {
+                spec.position_ms = spec.position_ms.saturating_add(elapsed_ms);
+                Self::Track(spec)
+            }
+            resume => resume,
+        }
+    }
 }
 
 impl LoadSpec {
@@ -354,6 +380,9 @@ pub struct Engine {
     /// What was playing when the session ended on its own.
     interrupted: Arc<Mutex<Option<Interrupted>>>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once a newer engine took over, so nothing this one still
+    /// reports reaches the app.
+    silenced: Arc<std::sync::atomic::AtomicBool>,
     audio: Arc<AudioControl>,
     /// The account's devices and playback as Spotify pushes them.
     cluster: Arc<crate::connect_state::ClusterView>,
@@ -371,6 +400,15 @@ impl Engine {
         cache: Cache,
         notify: Notify,
     ) -> Result<Self> {
+        let silenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify: Notify = {
+            let silenced = Arc::clone(&silenced);
+            Arc::new(move |event| {
+                if !silenced.load(std::sync::atomic::Ordering::SeqCst) {
+                    notify(event);
+                }
+            })
+        };
         let device_id = config.device_id();
         let session_config = SessionConfig {
             device_id: device_id.clone(),
@@ -488,6 +526,7 @@ impl Engine {
             state,
             interrupted,
             shutting_down,
+            silenced,
             audio,
             cluster,
         })
@@ -611,9 +650,27 @@ impl Engine {
         self.player.stop();
     }
 
+    /// Keeps whatever this engine still reports from the app, while its
+    /// player may go on playing.
+    pub fn silence(&self) {
+        self.silenced
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Shuts down an engine a newer one replaced, without letting its last
+    /// stopped state reach the app after the newer engine's playback.
+    pub fn retire(&self) {
+        self.silence();
+        self.shutdown();
+    }
+
     pub fn resume_point(&self) -> Option<PlaybackResume> {
         if let Some(snapshot) = self.spirc.disconnected_playback() {
-            return Some(PlaybackResume::Session(snapshot));
+            let position_ms = snapshot.position_ms();
+            return Some(PlaybackResume::Session {
+                snapshot,
+                position_ms,
+            });
         }
         self.interrupted().map(|interrupted| {
             PlaybackResume::Track(LoadSpec {
@@ -627,9 +684,13 @@ impl Engine {
 
     pub fn resume(&self, resume: PlaybackResume) -> Result<()> {
         match resume {
-            PlaybackResume::Session(snapshot) => {
-                self.spirc.restore_playback(snapshot).map_err(Into::into)
-            }
+            PlaybackResume::Session {
+                snapshot,
+                position_ms,
+            } => self
+                .spirc
+                .restore_playback_at(snapshot, position_ms)
+                .map_err(Into::into),
             PlaybackResume::Track(spec) => self.command(PlayerCommand::Load(spec)),
         }
     }
@@ -1778,6 +1839,26 @@ mod tests {
         state.playback = Playback::Playing;
         state.track = None;
         assert!(state.interrupted().is_none());
+    }
+
+    /// After a drop the old player went on playing, so the pickup starts
+    /// that much later; paused playback stays where it was.
+    #[test]
+    fn a_pickup_after_a_drop_starts_where_the_old_player_got_to() {
+        let position_after = |play: bool| {
+            let resume = PlaybackResume::Track(LoadSpec {
+                uris: vec!["spotify:track:x".into()],
+                position_ms: 30_000,
+                play,
+                ..LoadSpec::default()
+            });
+            match resume.played_on(Duration::from_millis(4_500)) {
+                PlaybackResume::Track(spec) => spec.position_ms,
+                PlaybackResume::Session { .. } => unreachable!("a track stays a track"),
+            }
+        };
+        assert_eq!(position_after(true), 34_500);
+        assert_eq!(position_after(false), 30_000);
     }
 
     /// The next engine starts at the level set last, exactly.
