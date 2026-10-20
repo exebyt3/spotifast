@@ -136,10 +136,15 @@ impl LikedSongs {
     pub fn absorb(&mut self, offset: u32, page: Page<SavedTrack>, now: i64) -> bool {
         if let Some(refresh) = &mut self.refresh {
             refresh.rows.absorb(offset, page);
-            if refresh.rows.items.len() < refresh.through && refresh.rows.next_offset.is_some() {
+            let spliced = splice_onto(&refresh.rows, &self.server);
+            if spliced.is_none()
+                && refresh.rows.items.len() < refresh.through
+                && refresh.rows.next_offset.is_some()
+            {
                 return true;
             }
-            self.server = self.refresh.take().expect("refresh exists").rows;
+            let refreshed = self.refresh.take().expect("refresh exists").rows;
+            self.server = spliced.unwrap_or(refreshed);
             self.synced = None;
             self.refreshed_at = now;
             self.saved_through = None;
@@ -360,6 +365,42 @@ impl LikedSongs {
     }
 }
 
+/// The refreshed first rows, then the rest of the rows already held, when
+/// all they show is new likes: the total grew by exactly the rows before the
+/// held list's first song, and the songs after them are the held list's
+/// start, added at the same moment. An unlike anywhere lowers the total or
+/// breaks that match, and the refresh then reads every page as before.
+fn splice_onto(
+    fresh: &PagedList<SavedTrack>,
+    held: &PagedList<SavedTrack>,
+) -> Option<PagedList<SavedTrack>> {
+    if !held.loaded_once || held.base_offset != 0 || !held.windows.is_empty() {
+        return None;
+    }
+    if fresh.base_offset != 0 || fresh.error.is_some() {
+        return None;
+    }
+    let total = fresh.total?;
+    let added = total.checked_sub(held.total?)?;
+    let overlap = fresh.items.get(added as usize..)?;
+    // A refresh that already holds every held row finishes without help.
+    if overlap.is_empty() || overlap.len() >= held.items.len() {
+        return None;
+    }
+    let matches = overlap
+        .iter()
+        .zip(&held.items)
+        .all(|(new, old)| new.track.uri == old.track.uri && new.added_at == old.added_at);
+    if !matches {
+        return None;
+    }
+    let mut items = fresh.items.clone();
+    items.extend_from_slice(&held.items[overlap.len()..]);
+    let mut rows = PagedList::default();
+    rows.restore_cached(items, total, held.next_offset.map(|next| next + added));
+    Some(rows)
+}
+
 /// The server total with each change's row added or removed, in order.
 fn count(total: u32, counted: &[bool]) -> u32 {
     counted.iter().fold(total, |total, &added| {
@@ -468,7 +509,8 @@ mod tests {
         let original = view.items.clone();
         let revision = view.revision;
         songs.start_refresh(2);
-        let mut first = page(0, 50, 100);
+        // An unlike elsewhere makes the whole list be read again.
+        let mut first = page(0, 50, 99);
         first.items[0].track.name = "Updated".into();
         assert!(songs.absorb(0, first, 20_000));
         songs.sync_view(&mut view);
@@ -477,10 +519,73 @@ mod tests {
             view.revision, revision,
             "unchanged visible rows retain their table revision"
         );
-        assert!(!songs.absorb(50, page(50, 50, 100), 20_000));
+        assert!(!songs.absorb(50, page(50, 49, 99), 20_000));
         songs.sync_view(&mut view);
-        assert_eq!(view.items.len(), 100);
+        assert_eq!(view.items.len(), 99);
         assert_eq!(view.items[0].track.name, "Updated");
+    }
+
+    /// The first refreshed page: `new` songs liked since, then the held
+    /// list's start.
+    fn first_page_after_likes(new: u32, total: u32) -> Page<SavedTrack> {
+        let mut items: Vec<SavedTrack> = (0..new).map(|n| item(1_000 + n)).collect();
+        items.extend((0..50 - new).map(item));
+        Page {
+            offset: 0,
+            limit: 50,
+            total,
+            next: Some("next".into()),
+            items,
+        }
+    }
+
+    #[test]
+    fn a_refresh_that_finds_only_new_likes_keeps_the_held_rows_after_one_page() {
+        let mut songs = loaded(500, 500);
+        songs.start_refresh(2);
+        let mut first = first_page_after_likes(3, 503);
+        first.items[3].track.name = "Updated".into();
+        assert!(!songs.absorb(0, first, 20_000));
+        let mut view = PagedList::default();
+        songs.sync_view(&mut view);
+        assert_eq!(view.items.len(), 503);
+        assert_eq!(view.total, Some(503));
+        assert!(view.is_complete());
+        assert_eq!(view.items[0].track.uri, item(1_000).track.uri);
+        assert_eq!(view.items[3].track.name, "Updated");
+        assert_eq!(view.items[502].track.uri, item(499).track.uri);
+        assert!(songs.fresh(20_001));
+        assert_eq!(songs.request_offset(), None);
+    }
+
+    #[test]
+    fn a_partial_list_resumes_past_the_new_likes() {
+        let mut songs = loaded(500, 10_000);
+        songs.start_refresh(2);
+        assert!(!songs.absorb(0, first_page_after_likes(2, 10_002), 20_000));
+        assert_eq!(songs.request_offset(), Some(502));
+        let mut view = PagedList::default();
+        songs.sync_view(&mut view);
+        assert_eq!(view.items.len(), 502);
+        assert_eq!(view.total, Some(10_002));
+    }
+
+    #[test]
+    fn unlikes_or_changed_rows_read_the_whole_list_again() {
+        // An unlike far down only shows in the total.
+        let mut songs = loaded(500, 500);
+        songs.start_refresh(2);
+        assert!(songs.absorb(0, page(0, 50, 499), 20_000));
+        // A like and an unlike keep the total but move the rows.
+        let mut songs = loaded(500, 500);
+        songs.start_refresh(2);
+        assert!(songs.absorb(0, first_page_after_likes(1, 500), 20_000));
+        // A song liked again keeps its place in the count but not its time.
+        let mut songs = loaded(500, 500);
+        songs.start_refresh(2);
+        let mut first = page(0, 50, 500);
+        first.items[10].added_at = Some("2026-10-20T12:00:00Z".into());
+        assert!(songs.absorb(0, first, 20_000));
     }
 
     #[test]
@@ -490,7 +595,7 @@ mod tests {
         songs.sync_view(&mut view);
         let original = view.items.clone();
         songs.start_refresh(2);
-        songs.absorb(0, page(0, 50, 100), 20_000);
+        songs.absorb(0, page(0, 50, 99), 20_000);
         songs.fail("Spotify is unavailable".into());
         songs.sync_view(&mut view);
         assert_eq!(view.items, original);

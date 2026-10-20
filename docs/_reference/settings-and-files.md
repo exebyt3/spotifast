@@ -150,8 +150,11 @@ Liked Songs metadata is stored separately under `liked-songs/` in the cache
 directory, one JSON file per account. Only the verified account's rows are
 shown. Fresh cached pages are reused for 15 minutes; older pages refresh in
 the background. Refreshing keeps the last usable rows until their replacement
-is ready, and a failed refresh leaves those rows visible. The refresh control
-requests current data immediately. Partial caches resume from their next page.
+is ready, and a failed refresh leaves those rows visible. When the first
+refreshed page shows only songs liked since, the rest of the cached rows are
+kept and the refresh ends there; an unlike reads the whole list again. The
+refresh control requests current data immediately. Partial caches resume from
+their next page.
 Like and Unlike change the rows immediately, and confirmed edits survive a
 restart even if Spotify's next read still reports the old state. This cache
 contains metadata, not offline audio, and can be deleted without signing out.

@@ -176,7 +176,9 @@ current-track pickup.
   This behavior is available since 0.8.0.
   Cached pages less than 15 minutes old need no repeat request. Older cached
   prefixes refresh through the existing Web API grant, one page at a time,
-  while the saved rows remain visible. Manual refresh starts immediately.
+  while the saved rows remain visible. A refresh that finds only new likes
+  on its first page keeps the rest of the cached rows instead of reading on.
+  Manual refresh starts immediately.
   Like and Unlike are kept over lagging reads until Spotify confirms them.
 - Spotifast has no telemetry, analytics, or hosted service. When the lyrics
   panel is open and Spotify has no lyrics, it sends the track's artist, title,
