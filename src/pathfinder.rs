@@ -91,73 +91,6 @@ pub async fn search(
     }
 }
 
-/// One page of the account's playlists, flattened out of their folders,
-/// as the Web API's `/me/playlists` pages them. The answer carries no
-/// song count, which the playlist's own page learns when it opens.
-pub async fn my_playlists(
-    session: &Session,
-    http: &Http,
-    offset: u32,
-    limit: u32,
-) -> Result<Page<Playlist>, Failure> {
-    let variables = json!({
-        "filters": ["Playlists"],
-        "order": null,
-        "textFilter": "",
-        "features": ["LIKED_SONGS", "YOUR_EPISODES"],
-        "limit": limit,
-        "offset": offset,
-        "flatten": true,
-        "expandedFolders": [],
-        "folderUri": null,
-        "includeFoldersWhenFlattening": false,
-        "withCuration": false,
-    });
-    let data = run(session, http, LIBRARY, variables, false).await?;
-    playlist_page(&data, offset, limit)
-}
-
-fn playlist_page(data: &Value, offset: u32, limit: u32) -> Result<Page<Playlist>, Failure> {
-    let library = data
-        .pointer("/me/libraryV3")
-        .ok_or_else(|| Failure::Retry(anyhow::anyhow!("library answered no playlists")))?;
-    let kind = library["__typename"].as_str().unwrap_or_default();
-    // A refusal is no empty library: the Web API answers instead.
-    if kind.ends_with("Error") {
-        return Err(Failure::Retry(anyhow::anyhow!("library refused: {library}")));
-    }
-    let entries = library["items"].as_array().map_or(&[][..], Vec::as_slice);
-    // Liked songs and episodes ride along as pseudo playlists; the page's
-    // own paging counts them, so the next offset still lines up.
-    let items: Vec<Playlist> = entries
-        .iter()
-        .filter_map(|entry| playlist(&entry["item"]["data"]))
-        .collect();
-    let skipped: Vec<&str> = entries
-        .iter()
-        .map(|entry| entry["item"]["data"]["__typename"].as_str().unwrap_or("?"))
-        .filter(|kind| *kind != "Playlist")
-        .collect();
-    log::debug!(
-        "library page at {offset}: {kind}, {} entries, {} playlists, skipped {skipped:?}, total {}",
-        entries.len(),
-        items.len(),
-        library["totalCount"]
-    );
-    let seen = offset.saturating_add(entries.len() as u32);
-    let total = library["totalCount"]
-        .as_u64()
-        .and_then(|total| u32::try_from(total).ok())
-        .unwrap_or(seen);
-    Ok(Page {
-        next: (seen < total).then(String::new),
-        items,
-        total,
-        limit,
-        offset,
-    })
-}
-
 /// One page of the account's saved albums, newest first, as the Web API's
 /// `/me/albums` pages them.
 pub async fn saved_albums(
@@ -1092,37 +1025,6 @@ mod tests {
         assert!(song.explicit);
         assert_eq!(song.artists[0].name, "MBP Mayo");
         assert!(saved_page(&json!({}), 0, 50).is_err());
-    }
-
-    #[test]
-    fn the_playlist_list_skips_the_pseudo_playlists() {
-        let data = json!({"me": {"libraryV3": {"totalCount": 132, "items": [
-            {"item": {"__typename": "LibraryPseudoPlaylistResponseWrapper",
-                      "data": {"__typename": "LibraryPseudoPlaylist", "name": "Liked Songs"}}},
-            {"item": {"__typename": "PlaylistResponseWrapper", "data": {
-                "__typename": "Playlist",
-                "uri": "spotify:playlist:1IkRJXxPpLZPe4gLIdgnM1",
-                "name": "favorites 2",
-                "description": "",
-                "revisionId": "AAACRDslneBYy+8TlromPsCXwRol9/4g",
-                "images": {"items": [{"sources": [{"url": "https://mosaic.scdn.co/640/x", "width": 640, "height": 640}]}]},
-                "ownerV2": {"data": {"id": "mbtoq9", "username": "mbtoq9", "name": "exebyte.", "uri": "spotify:user:mbtoq9"}}
-            }}}
-        ]}}});
-        let page = playlist_page(&data, 50, 50).unwrap();
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.total, 132);
-        assert_eq!(page.offset, 50);
-        assert!(page.next.is_some(), "52 of 132 seen");
-        let list = &page.items[0];
-        assert_eq!(list.id, "1IkRJXxPpLZPe4gLIdgnM1");
-        assert_eq!(list.snapshot_id.as_deref(), Some("AAACRDslneBYy+8TlromPsCXwRol9/4g"));
-        assert_eq!(list.owner.display_name.as_deref(), Some("exebyte."));
-        assert_eq!(list.description, None);
-        assert!(list.images[0].url.starts_with("https://mosaic.scdn.co/"));
-        assert!(playlist_page(&json!({}), 0, 50).is_err());
-        let refused = json!({"me": {"libraryV3": {"__typename": "LibraryInternalError"}}});
-        assert!(playlist_page(&refused, 0, 50).is_err(), "a refusal is no empty library");
     }
 
     #[test]
