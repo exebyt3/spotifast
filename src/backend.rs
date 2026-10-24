@@ -6059,7 +6059,7 @@ async fn over_session(
                 SessionAnswer::Album(settle(session_reads::album_by_id(session, id).await)?)
             }
             SessionRead::AlbumTracks { id, offset } => SessionAnswer::AlbumTracks(settle(
-                session_reads::album_tracks(session, id, offset, ALBUM_TRACKS_PAGE_SIZE).await,
+                session_reads::album_track_page(session, id, offset, ALBUM_TRACKS_PAGE_SIZE).await,
             )?),
             SessionRead::Track { id } => {
                 SessionAnswer::Track(settle(session_reads::track_by_id(session, id).await)?)
@@ -9660,7 +9660,7 @@ mod session_tests {
                 offset: 0,
                 generation: 7,
                 result: Ok(page),
-            }) = session_response(&request, answer)
+            }) = session_response(&request, answer, None)
             else {
                 panic!("expected the whole library from the top");
             };

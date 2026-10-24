@@ -1018,6 +1018,7 @@ const PLAYED_KEPT: usize = 1000;
 /// a later page that fails leaves the songs gathered so far.
 async fn session_pages(session: &Session, first: &[u8]) -> anyhow::Result<Vec<String>> {
     let path = crate::paths::AppDirs::discover()
+        .dirs
         .state
         .join("session-played.json");
     let mut played: Vec<String> = std::fs::read(&path)
@@ -1177,7 +1178,7 @@ pub async fn related_artists(session: &Session, id: &str) -> Result<Vec<Artist>,
         .collect())
 }
 
-/// An album's header. The songs come page by page from [`album_tracks`], as
+/// An album's header. The songs come page by page from [`album_track_page`], as
 /// they do from the Web API.
 pub async fn album_by_id(session: &Session, id: &str) -> Result<Album, Failure> {
     let message = album_message(session, id).await?;
@@ -1188,7 +1189,7 @@ pub async fn album_by_id(session: &Session, id: &str) -> Result<Album, Failure> 
 /// One page of the album's songs in disc and track order, with their
 /// details from one batched request. A song Spotify has no details for
 /// would leave a hole in the numbering, so the Web API is asked instead.
-pub async fn album_tracks(
+pub async fn album_track_page(
     session: &Session,
     id: &str,
     offset: u32,
