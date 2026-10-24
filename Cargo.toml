@@ -319,14 +319,12 @@ hyper-proxy2 = { git = "https://github.com/crmne/hyper-proxy2", rev = "efca48113
 # patch once upstream merges it.
 # The fork pins exebyt3/librespot spotifast-0.13.3: that revision plus
 # librespot-org's #1795, so a song picked in a phone's playlist plays instead
-# of the playlist's first (the app sends an empty track_uri next to the uid),
-# and `Spirc::restore_playback_at`, so a dropped session is picked up where
-# the old player got to while the new session came up.
-# Go back to crmne/librespot once its spotifast-dev carries both.
-librespot-audio = { git = "https://github.com/exebyt3/librespot", rev = "d1a4d03e9757ff135da41c1846b8788002c88dec" }
-librespot-connect = { git = "https://github.com/exebyt3/librespot", rev = "d1a4d03e9757ff135da41c1846b8788002c88dec" }
-librespot-core = { git = "https://github.com/exebyt3/librespot", rev = "d1a4d03e9757ff135da41c1846b8788002c88dec" }
-librespot-metadata = { git = "https://github.com/exebyt3/librespot", rev = "d1a4d03e9757ff135da41c1846b8788002c88dec" }
-librespot-oauth = { git = "https://github.com/exebyt3/librespot", rev = "d1a4d03e9757ff135da41c1846b8788002c88dec" }
-librespot-playback = { git = "https://github.com/exebyt3/librespot", rev = "d1a4d03e9757ff135da41c1846b8788002c88dec" }
-librespot-protocol = { git = "https://github.com/exebyt3/librespot", rev = "d1a4d03e9757ff135da41c1846b8788002c88dec" }
+# of the playlist's first (the app sends an empty track_uri next to the uid).
+# Go back to crmne/librespot once its spotifast-dev carries #1795.
+librespot-audio = { git = "https://github.com/exebyt3/librespot", rev = "80bc669a31f7a343f00083ed7ba634d42c41a794" }
+librespot-connect = { git = "https://github.com/exebyt3/librespot", rev = "80bc669a31f7a343f00083ed7ba634d42c41a794" }
+librespot-core = { git = "https://github.com/exebyt3/librespot", rev = "80bc669a31f7a343f00083ed7ba634d42c41a794" }
+librespot-metadata = { git = "https://github.com/exebyt3/librespot", rev = "80bc669a31f7a343f00083ed7ba634d42c41a794" }
+librespot-oauth = { git = "https://github.com/exebyt3/librespot", rev = "80bc669a31f7a343f00083ed7ba634d42c41a794" }
+librespot-playback = { git = "https://github.com/exebyt3/librespot", rev = "80bc669a31f7a343f00083ed7ba634d42c41a794" }
+librespot-protocol = { git = "https://github.com/exebyt3/librespot", rev = "80bc669a31f7a343f00083ed7ba634d42c41a794" }

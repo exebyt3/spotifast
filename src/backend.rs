@@ -1659,9 +1659,6 @@ struct Worker {
     resume: Option<PlaybackResume>,
     /// A pickup in flight: the load to repeat and how often it was tried.
     resume_verify: Option<(PlaybackResume, u8)>,
-    /// The engine of a session that dropped on its own, and since when. Its
-    /// player goes on with what it had until the next engine picks it up.
-    outgoing: Option<(Arc<Engine>, Instant)>,
     network_reachable: bool,
     waiting_for_network: bool,
     engine_attempt: u64,
@@ -1739,7 +1736,6 @@ impl Worker {
             reconnects: Vec::new(),
             resume: None,
             resume_verify: None,
-            outgoing: None,
             network_reachable: true,
             waiting_for_network: false,
             engine_attempt: 0,
@@ -2533,7 +2529,6 @@ impl Worker {
                 }
             }
         }
-        self.retire_outgoing();
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
@@ -2775,7 +2770,6 @@ impl Worker {
             && let SessionState::Ready { account } = self.api.state(source)
         {
             if account.as_str() != user.id {
-                self.retire_outgoing();
                 if let Some(engine) = self.engine.take() {
                     engine.shutdown();
                 }
@@ -3038,7 +3032,6 @@ impl Worker {
         self.radio_waiting.clear();
         self.prerelease_waiting = None;
         self.carry_volume();
-        self.retire_outgoing();
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
@@ -3170,14 +3163,13 @@ impl Worker {
         if defer_engine_replace(self.engine_busy, &mut self.engine_restart_pending) {
             return;
         }
-        self.take_engine_for_resume(false);
+        self.take_engine_for_resume();
         self.resume_engine();
     }
 
-    /// Reconnect the engine after its session dropped on its own. The old
-    /// player goes on with the current song meanwhile, and the new session
-    /// picks it up where that player got to, so a dropped connection is a
-    /// break of about a second rather than several.
+    /// Reconnect the engine after its session dropped on its own. Whatever
+    /// was playing comes back at the same spot on the new session, so a
+    /// dropped connection is a pause of a few seconds rather than silence.
     /// Six drops in ten minutes stop the loop so a flapping session cannot
     /// sit there reconnecting forever.
     fn reconnect_engine(&mut self) {
@@ -3188,14 +3180,14 @@ impl Worker {
             return;
         }
         if !self.network_reachable {
-            self.take_engine_for_resume(false);
+            self.take_engine_for_resume();
             self.waiting_for_network = true;
             self.emit(Event::Playback(LocalPlayback::WaitingForNetwork));
             return;
         }
         let now = Instant::now();
         if session_drops_exhausted(&mut self.reconnects, now) {
-            self.take_engine_for_resume(false);
+            self.take_engine_for_resume();
             self.resume = None;
             self.emit(Event::Playback(LocalPlayback::Failed(
                 "Local playback keeps dropping. Re-enable it from Settings.".into(),
@@ -3207,8 +3199,7 @@ impl Worker {
             "local playback session ended; reconnecting ({} of {RECONNECT_LIMIT} in ten minutes)",
             self.reconnects.len()
         );
-        self.take_engine_for_resume(true);
-        self.resume_engine();
+        self.replace_engine();
     }
 
     /// Try the saved grant again after a backoff. Each failure in a row
@@ -3266,30 +3257,14 @@ impl Worker {
     /// playback, and the level being heard. A session that drops on its own
     /// comes back at the level it was heard at, not at the level the app
     /// launched with.
-    ///
-    /// With `keep_playing`, the engine's player goes on with what it had,
-    /// unheard by the app, until the next engine takes over.
-    fn take_engine_for_resume(&mut self, keep_playing: bool) {
-        self.retire_outgoing();
+    fn take_engine_for_resume(&mut self) {
         self.resume_verify = None;
         self.album_type_lookup.requeue_active_for_new_engine();
         self.playlist_header_lookup.requeue_active_for_new_engine();
         self.carry_volume();
         if let Some(engine) = self.engine.take() {
             self.resume = engine.resume_point();
-            if keep_playing && self.resume.is_some() {
-                engine.silence();
-                self.outgoing = Some((engine, Instant::now()));
-            } else {
-                engine.shutdown();
-            }
-        }
-    }
-
-    /// Stops the dropped session's player, if one is still going.
-    fn retire_outgoing(&mut self) {
-        if let Some((engine, _)) = self.outgoing.take() {
-            engine.retire();
+            engine.shutdown();
         }
     }
 
@@ -3588,8 +3563,6 @@ impl Worker {
                     // the load and retry if needed.
                     self.resume_verify = Some((spec, 0));
                     self.schedule_resume_check(1_500);
-                } else {
-                    self.retire_outgoing();
                 }
                 self.engine = Some(engine);
                 self.start_rootlist();
@@ -3657,7 +3630,6 @@ impl Worker {
             self.album_type_lookup.clear_engine_work();
             self.playlist_header_lookup.clear_engine_work();
             self.carry_volume();
-            self.retire_outgoing();
             if let Some(engine) = self.engine.take() {
                 engine.shutdown();
             }
@@ -3794,15 +3766,9 @@ impl Worker {
     /// Verifies playback after reconnect and retries loads rejected while
     /// Spirc is still registering. Runs on the backend timer.
     fn verify_resume(&mut self) {
-        let Some((mut spec, attempts)) = self.resume_verify.take() else {
+        let Some((spec, attempts)) = self.resume_verify.take() else {
             return;
         };
-        // The new session takes over here: the dropped session's player
-        // stops, and the pickup starts where it got to.
-        if let Some((outgoing, since)) = self.outgoing.take() {
-            outgoing.retire();
-            spec = spec.played_on(since.elapsed());
-        }
         let Some(engine) = &self.engine else {
             return;
         };
