@@ -3469,20 +3469,26 @@ impl App {
             return;
         }
         let mut candidates = HashSet::new();
-        for page in self.playlist_pages.values() {
-            for item in &page.items.items {
-                let Some(PlayableItem::Track(candidate)) = item.playable() else {
-                    continue;
-                };
-                if same_recording_hint(track, candidate)
-                    && let Some(id) = candidate.id.as_ref()
-                    && self
-                        .track_cache
-                        .get(id)
-                        .is_none_or(|known| known.recording_key().is_none())
-                {
-                    candidates.insert(id.clone());
-                }
+        // Liked Songs come from pathfinder without ISRCs too, and they are
+        // what the heart reads.
+        let listed = self
+            .playlist_pages
+            .values()
+            .flat_map(|page| &page.items.items)
+            .filter_map(|item| match item.playable() {
+                Some(PlayableItem::Track(candidate)) => Some(candidate),
+                _ => None,
+            })
+            .chain(self.library.liked.items.iter().map(|item| &item.track));
+        for candidate in listed {
+            if same_recording_hint(track, candidate)
+                && let Some(id) = candidate.id.as_ref()
+                && self
+                    .track_cache
+                    .get(id)
+                    .is_none_or(|known| known.recording_key().is_none())
+            {
+                candidates.insert(id.clone());
             }
         }
         for id in candidates {
@@ -3556,10 +3562,15 @@ impl App {
         self.resume_context = self.playing_context_uri();
         self.resume_track = Some(now.uri.clone());
         self.resume_position_ms = 0;
+        // A track cached from a pathfinder row has no ISRC, and without it
+        // a liked copy under another URI cannot fill the heart.
         if now.local
             && !now.is_episode
             && let Some(id) = &now.id
-            && !self.track_cache.contains_key(id)
+            && self
+                .track_cache
+                .get(id)
+                .is_none_or(|known| known.external_ids.isrc.is_none())
             && self.track_requests.insert(id.clone())
         {
             self.backend.api(ApiRequest::Track { id: id.clone() });
@@ -12797,7 +12808,9 @@ fn same_recording_hint(left: &Track, right: &Track) -> bool {
         && !left.name.is_empty()
         && left.name == right.name
         && left.duration_ms > 0
-        && left.duration_ms == right.duration_ms
+        // A single and its album cut share an ISRC but can differ by a few
+        // dozen milliseconds; the ISRC decides, this only picks who to ask.
+        && left.duration_ms.abs_diff(right.duration_ms) <= 2000
         && !left.artists.is_empty()
         && left.artists.len() == right.artists.len()
         && left
@@ -25192,6 +25205,48 @@ mod tests {
 
         assert_eq!(app.is_saved(playing_uri), Some(true));
         assert_eq!(app.saved_toggle_targets(playing_uri), vec![saved_uri]);
+    }
+
+    #[test]
+    fn a_liked_copy_without_an_isrc_fills_the_heart_of_its_alternative() {
+        let mut app = headless_app();
+        let song = |id: &str, duration_ms: u32, isrc: Option<&str>| Track {
+            id: Some(id.into()),
+            uri: format!("spotify:track:{id}"),
+            name: "we fell in love in october".into(),
+            duration_ms,
+            artists: vec![crate::api::models::ArtistRef {
+                id: Some("girlinred".into()),
+                name: "girl in red".into(),
+                ..Default::default()
+            }],
+            external_ids: crate::api::models::ExternalIds {
+                isrc: isrc.map(Into::into),
+            },
+            ..Default::default()
+        };
+        // Liked from the single, playing from the album, both read from
+        // pathfinder rows that carry no ISRC.
+        app.library.liked.items.push(SavedTrack {
+            track: song("single", 184153, None),
+            ..Default::default()
+        });
+        app.set_saved_state("spotify:track:single".into(), true);
+        app.handle_api(ApiResponse::Track {
+            id: "album".into(),
+            result: Ok(song("album", 184180, Some("NOG841549010"))),
+        });
+        assert!(
+            app.track_requests.contains("single"),
+            "the liked copy is asked for its ISRC"
+        );
+        assert_eq!(app.is_saved("spotify:track:album"), None);
+
+        app.handle_api(ApiResponse::Track {
+            id: "single".into(),
+            result: Ok(song("single", 184153, Some("NOG841549010"))),
+        });
+        assert_eq!(app.is_saved("spotify:track:album"), Some(true));
     }
 
     #[test]
