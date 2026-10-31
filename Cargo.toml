@@ -1,7 +1,7 @@
 [package]
 name = "spotifast"
 default-run = "spotifast"
-version = "0.14.1"
+version = "0.14.2"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -140,6 +140,10 @@ librespot-protocol = { version = "0.8", default-features = false }
 protobuf = "3"
 # Reads the Connect state Spotify pushes over the dealer's stream.
 futures-util = { version = "0.3", default-features = false }
+# Reads a local file's embedded cover and lyrics. The same decoder librespot
+# already plays local files with, with the formats it enables, so nothing
+# new is built.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac"] }
 # Local playback's audio sink is this crate's own (src/sink.rs): librespot's
 # rodio backend unwraps the device open on the player thread, and a release
 # build aborts on panic, so it is left out. rodio supplies the mixer and the
@@ -337,17 +341,21 @@ hyper-proxy2 = { git = "https://github.com/crmne/hyper-proxy2", rev = "efca48113
 # reads (#1829), the local file lookup made public (#1830), playlist rows
 # changed by index (#1831), the start of upcoming tracks prefetched so a
 # skip plays at once (#1832), and collection set reads and writes for songs
-# hidden in a playlist (#1833).
+# hidden in a playlist (#1833), local files added to the queue (#1839),
+# local files played at any sample rate (#1838) and in any channel
+# layout (#1840), audio keys asked for one at a time with a back-off after
+# a refusal (#1844), loads dropped once skipped past (#1845), and the key
+# prefetched for the next track only (#1846).
 # Every librespot crate comes from the fork so one copy exists. Drop each
 # patch once upstream merges it.
-# The fork pins exebyt3/librespot spotifast-0.14.1: the revision above plus
+# The fork pins exebyt3/librespot spotifast-0.14.2: the revision above plus
 # librespot-org's #1795, so a song picked in a phone's playlist plays instead
 # of the playlist's first (the app sends an empty track_uri next to the uid).
 # Go back to crmne/librespot once its spotifast-dev carries it.
-librespot-audio = { git = "https://github.com/exebyt3/librespot", rev = "6482887dcc1b0175d35cf17c324dffc54af05356" }
-librespot-connect = { git = "https://github.com/exebyt3/librespot", rev = "6482887dcc1b0175d35cf17c324dffc54af05356" }
-librespot-core = { git = "https://github.com/exebyt3/librespot", rev = "6482887dcc1b0175d35cf17c324dffc54af05356" }
-librespot-metadata = { git = "https://github.com/exebyt3/librespot", rev = "6482887dcc1b0175d35cf17c324dffc54af05356" }
-librespot-oauth = { git = "https://github.com/exebyt3/librespot", rev = "6482887dcc1b0175d35cf17c324dffc54af05356" }
-librespot-playback = { git = "https://github.com/exebyt3/librespot", rev = "6482887dcc1b0175d35cf17c324dffc54af05356" }
-librespot-protocol = { git = "https://github.com/exebyt3/librespot", rev = "6482887dcc1b0175d35cf17c324dffc54af05356" }
+librespot-audio = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
+librespot-connect = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
+librespot-core = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
+librespot-metadata = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
+librespot-oauth = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
+librespot-playback = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
+librespot-protocol = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }

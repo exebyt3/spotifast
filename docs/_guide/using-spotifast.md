@@ -38,7 +38,7 @@ fill the rest.
 your account, in Spotify's order, when local playback and a current Web API
 Home grant for that playback account are available. If local playback is
 unavailable, the session read fails, or the grant check fails, the same shelf
-shows approximate matches found through the shared Web API. Shared access can
+shows approximate matches found through a Web API playlist search, which can
 be rate-limited. If a refresh fails, cards already on screen remain available;
 **Retry** is shown when the first load fails. Spotify DJ is left out because
 Spotifast cannot play its special context.
@@ -262,8 +262,11 @@ this playlist**. On macOS, both `Delete` and `Fn+Delete` work. Text fields,
 dialogs and open menus keep Delete from acting on the list.
 
 Press and hold the player bar's volume slider to update local volume without
-moving the pointer. Remote volume is sent on release. The seek slider previews
-on press and seeks on release.
+moving the pointer. Remote volume is sent on release and keeps your chosen
+level while Spotify updates, including during rate limits. Fresh updates
+can confirm the level or show a change made on another device. If the volume
+request fails, an error appears and the slider returns to the reported level.
+The seek slider previews on press and seeks on release.
 
 The default local output smooths volume and mute changes over 30 ms. Explicit
 track changes and play/pause/stop use nominal 50 ms fades. Stopping can shorten
@@ -296,6 +299,8 @@ Winamp skins do not yet have equivalent accessibility coverage.
 | `Ctrl+F` or `/` | Search |
 | `Ctrl+B` | Show or hide the sidebar |
 | `Alt+←` / `Alt+→` | Back or forward |
+| `Page Up` / `Page Down` | Scroll the main page one page |
+| `Home` / `End` | Top or bottom of the main page |
 | `Ctrl+H` / `Ctrl+L` | Home / Liked Songs |
 | `Ctrl+Shift+A` / `Ctrl+Shift+B` | Playing artist / album |
 | `Ctrl+A` | Select every song in a playlist, album or Liked Songs |
@@ -309,6 +314,11 @@ Winamp skins do not yet have equivalent accessibility coverage.
 
 On macOS, `Cmd` replaces `Ctrl`. A focused text field keeps its usual keys
 for its own text.
+
+Repeat cycles through off, the whole list, and one song. As in Spotify's own
+apps, choosing another song while one song repeats (Next, Previous, or playing
+a song) turns Repeat One back into repeating the whole list. Previous that
+restarts the song keeps it repeating.
 
 ## Controlling it from the command line
 
@@ -474,7 +484,7 @@ bullet; each artist name remains a separate link.
 **Settings > Playback on this computer > Start with your computer** opens
 Spotifast when you log in. **With the window** opens it as you would;
 **In the tray** starts it without a window, ready for media keys and the tray
-icon. **Off** leaves your login alone.
+icon; on macOS it reads **In the menu bar**. **Off** leaves your login alone.
 
 The setting is your system's own list of what starts at login, read back each
 time Settings opens, so turning Spotifast off there (System Settings on macOS,
@@ -599,6 +609,12 @@ resume playback directly from the notch.
 To turn on the notch overlay, check **MacBook notch widget** in
 Settings under **Playback on this computer**.
 
+## Where the music is playing from
+
+Above the current song, the queue panel says what it is playing from: the
+playlist, album, artist or other page. Click the name to open that page. A
+radio has no page, so its name is plain text.
+
 ## Recent
 
 The queue panel's second tab combines Spotify's history with tracks played
@@ -621,6 +637,12 @@ Storage shows its location and has a **Clear history** button.
 On Windows, the main window's minimize, maximize, and close buttons share the
 top bar with Spotifast's controls. Drag an empty part of that bar to move or
 snap the window, and drag a window edge or corner to resize it.
+
+## When Spotify won't play a song here {#audio-key}
+
+If a song shows up as playing but nothing plays, and a banner says Spotify
+won't let this computer play this song right now, see
+[Spotify refused the audio key](/troubleshooting/#audio-key).
 
 ## Choosing the audio output
 
@@ -740,6 +762,9 @@ use a personal Spotify app, reconnect it in Settings as well.
 ## Lyrics
 
 Choose the microphone button in the player bar, or press **L**, to open lyrics.
+A local file from a playlist shows the words in a `.lrc` file of the same name
+beside it, or in its own tags, and the cover in its tags; otherwise lyrics come
+from LRCLIB by its artist, title, album and length.
 Synced lyrics follow the playing line automatically. Scroll to pause following,
 choose **Follow** to resume it, or choose a line to jump to that part of the song.
 

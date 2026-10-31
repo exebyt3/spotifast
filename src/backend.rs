@@ -15,8 +15,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::api::models::*;
 use crate::api::{
-    AccountId, ApiError, ApiGateway, ApiSource, NetActivity, Operation, PlayRequest, PlaylistId,
-    SessionState, TokenProvider, WebTokens,
+    AccountId, ApiClient, ApiError, ApiGateway, ApiSource, NetActivity, Operation, PlayRequest,
+    PlaylistId, SessionState, TokenProvider, WebTokens,
 };
 use crate::credentials::{
     Grant as StoredGrant, Lease as CredentialLease, Slot as CredentialSlot,
@@ -24,7 +24,7 @@ use crate::credentials::{
 };
 use crate::http::Http;
 use crate::images::{ArtLoader, art_palette};
-use crate::model::PlaylistCache;
+use crate::model::{PlaylistCache, TopPeriod};
 use crate::paths::AppDirs;
 use crate::player::{
     Engine, EngineConfig, EngineEvent, Heard, KeptPlayer, LoadSpec, LocalState, PlaybackResume,
@@ -47,13 +47,16 @@ const AUDIOBOOK_BATCH: usize = 50;
 /// How long resolving a radio station and its songs may take.
 const RADIO_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The `spotify:local:` URIs of the songs in `folder` and its subfolders,
-/// found exactly as the player finds them, so the songs a playlist lists
-/// that will play are the ones shown as playable.
-fn local_file_uris(folder: &std::path::Path) -> HashSet<String> {
+/// The songs in `folder` and its subfolders by the `spotify:local:` URIs
+/// they play for, found exactly as the player finds them, so the songs a
+/// playlist lists that will play are the ones shown as playable, and each
+/// one's file can be read for its cover and lyrics.
+fn local_file_uris(
+    folder: &std::path::Path,
+) -> std::collections::HashMap<String, std::path::PathBuf> {
     librespot_playback::local_file::create_local_file_lookup(&[folder.to_path_buf()])
         .iter()
-        .map(|(uri, _)| uri.to_uri())
+        .map(|(uri, path)| (uri.to_uri(), path.to_path_buf()))
         .collect()
 }
 /// Newest episodes read from each saved podcast for Home's podcast shelf.
@@ -98,10 +101,34 @@ fn defer_engine_replace(engine_busy: bool, restart_pending: &mut bool) -> bool {
 pub enum AuthStatus {
     Starting,
     SignedOut,
-    WaitingForBrowser { url: String },
+    WaitingForBrowser {
+        url: String,
+    },
     Connecting,
-    Connected { username: String },
+    Connected {
+        username: String,
+    },
     Failed(String),
+    /// Spotify turned the sign-in down for a reason the sign-in screen
+    /// explains in the listener's language and shows how to fix.
+    Refused(SignInProblem),
+}
+
+/// Why Spotify turned a sign-in down, for the sign-in screen to explain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignInProblem {
+    /// What was pasted is not shaped like a Client ID.
+    MalformedClientId,
+    /// Spotify has never issued the Client ID.
+    UnknownClient,
+    /// The personal app does not let this account in: it is not the
+    /// account that created the app, or that account has no Premium.
+    AccountNotAllowed,
+    /// Spotify refused the grant from before 0.14.2 that came through the
+    /// app Spotifast used to share, and there is no personal app to go on.
+    SharedRetired,
+    /// Spotify refused the personal app's saved grant.
+    Expired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,7 +138,10 @@ pub enum RemoteAction {
     Next,
     Previous,
     Seek,
-    Volume,
+    /// Echo the adjustment's serial so late replies cannot settle a newer one.
+    Volume {
+        request: u64,
+    },
     Shuffle,
     Repeat,
 }
@@ -143,6 +173,7 @@ pub enum ApiRequest {
         limit: u32,
     },
     TopTracks {
+        period: TopPeriod,
         offset: u32,
         full: bool,
         generation: u64,
@@ -404,6 +435,7 @@ pub enum ApiResponse {
         result: ApiResult<CursorPage<PlayHistory>>,
     },
     TopTracks {
+        period: TopPeriod,
         offset: u32,
         full: bool,
         generation: u64,
@@ -710,6 +742,8 @@ pub enum Command {
     SignIn {
         request: u64,
         config: ProxyConfig,
+        /// The listener's own app, from the sign-in screen.
+        client_id: Option<String>,
     },
     CancelSignIn,
     SignOut,
@@ -929,15 +963,18 @@ pub struct LyricsRequest {
     /// The track the answer is for, so a stale one is ignored.
     pub uri: String,
     pub query: crate::lyrics::Query,
+    /// The local file a `spotify:local:` track plays from, whose own
+    /// lyrics come before LRCLIB's.
+    pub local_file: Option<std::path::PathBuf>,
 }
 
 pub enum Event {
     /// The folder picked in the local files dialog; `None` when cancelled.
     LocalFilesFolderChosen(Option<std::path::PathBuf>),
-    /// The `spotify:local:` URIs the songs in `folder` play for.
+    /// The songs in `folder`, by the `spotify:local:` URIs they play for.
     LocalFiles {
         folder: std::path::PathBuf,
-        uris: Arc<HashSet<String>>,
+        uris: Arc<std::collections::HashMap<String, std::path::PathBuf>>,
     },
     ProxyRestored {
         config: ProxyConfig,
@@ -1081,6 +1118,8 @@ pub enum Event {
     WebApp {
         client_id: Option<String>,
     },
+    /// Whether a shared grant from before 0.14.2 is signed in.
+    SharedGrant(bool),
     LikedSongsCache {
         account_id: String,
         generation: u64,
@@ -1159,6 +1198,8 @@ pub struct Backend {
     #[cfg(test)]
     home_cache_stores:
         std::sync::Mutex<Vec<crate::account_cache::Cache<crate::model::HomeSnapshot>>>,
+    #[cfg(test)]
+    top_tracks_requests: std::sync::Mutex<Vec<(TopPeriod, u32, bool, u64)>>,
 }
 
 impl Backend {
@@ -1255,6 +1296,8 @@ impl Backend {
             playlist_row_removals: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             home_cache_stores: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            top_tracks_requests: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1424,6 +1467,19 @@ impl Backend {
                     *generation,
                 ));
         }
+        #[cfg(test)]
+        if let ApiRequest::TopTracks {
+            period,
+            offset,
+            full,
+            generation,
+        } = &request
+        {
+            self.top_tracks_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((*period, *offset, *full, *generation));
+        }
         self.send(Command::Api(request));
     }
 
@@ -1468,6 +1524,16 @@ impl Backend {
         std::mem::take(
             &mut *self
                 .home_episode_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_top_tracks_requests(&self) -> Vec<(TopPeriod, u32, bool, u64)> {
+        std::mem::take(
+            &mut *self
+                .top_tracks_requests
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
@@ -1964,7 +2030,9 @@ impl Worker {
         Ok(restart)
     }
 
-    fn change_proxy(&mut self, request: u64, proxy: ProxyConfig, sign_in: bool) {
+    /// Applies a proxy, then signs in with `sign_in`'s Client ID when that
+    /// is the sign-in screen's button.
+    fn change_proxy(&mut self, request: u64, proxy: ProxyConfig, sign_in: Option<Option<String>>) {
         let result = self.apply_proxy(proxy.clone());
         if result.as_ref().is_ok_and(|restart| *restart) {
             self.replace_engine();
@@ -1981,8 +2049,8 @@ impl Worker {
         if applied {
             self.persist_proxy_password(&proxy);
             self.finish_proxy_restore();
-            if sign_in {
-                self.sign_in();
+            if let Some(client_id) = sign_in {
+                self.sign_in(client_id);
             }
         }
     }
@@ -2241,7 +2309,11 @@ impl Worker {
                     });
                 }
                 Command::Shutdown => break,
-                Command::SignIn { request, config } => self.change_proxy(request, config, true),
+                Command::SignIn {
+                    request,
+                    config,
+                    client_id,
+                } => self.change_proxy(request, config, Some(client_id)),
                 Command::CancelSignIn => {
                     self.authorization_attempt += 1;
                     if let Some(cancel) = self.cancel_signin.take() {
@@ -2281,9 +2353,7 @@ impl Worker {
                     self.engine_config = config;
                     self.replace_engine();
                 }
-                Command::ApplyProxy { request, config } => {
-                    self.change_proxy(request, config, false)
-                }
+                Command::ApplyProxy { request, config } => self.change_proxy(request, config, None),
                 Command::Player(PlayerCommand::Load(spec))
                     if self.engine.is_some() && session_context_of(&spec).is_some() =>
                 {
@@ -2372,13 +2442,25 @@ impl Worker {
                     }
                     for source in expired {
                         self.forget_web_grant(source);
-                        if source == ApiSource::Personal {
-                            self.emit(Event::WebApp { client_id: None });
-                        } else {
+                        self.emit(match source {
+                            ApiSource::Personal => Event::WebApp { client_id: None },
+                            ApiSource::Shared => Event::SharedGrant(false),
+                        });
+                        // Either grant carries the session alone when the
+                        // other is gone; only losing the last one signs out.
+                        let other_ready = match source {
+                            ApiSource::Shared => self.api.personal_ready(),
+                            ApiSource::Personal => matches!(
+                                self.api.state(ApiSource::Shared),
+                                SessionState::Ready { .. }
+                            ),
+                        };
+                        if !other_ready {
                             self.signed_in = false;
-                            self.emit(Event::Auth(AuthStatus::Failed(
-                                "Your Spotify sign-in expired. Please sign in again.".into(),
-                            )));
+                            self.emit(Event::Auth(AuthStatus::Refused(match source {
+                                ApiSource::Shared => SignInProblem::SharedRetired,
+                                ApiSource::Personal => SignInProblem::Expired,
+                            })));
                         }
                     }
                     if let ApiResponse::Me(Ok(user)) = response.as_ref()
@@ -2502,6 +2584,15 @@ impl Worker {
                         }
                         if let Some(pending) = self.pending_authorization.take() {
                             self.sign_in_source(pending);
+                        } else if self.signed_in
+                            && self.api.state(ApiSource::Personal) == SessionState::Unavailable
+                            && self.api.state(ApiSource::Shared) == SessionState::Unavailable
+                        {
+                            // Choosing another app in Settings let go of the
+                            // only grant, and its sign-in never finished:
+                            // nothing is left to answer the app.
+                            self.signed_in = false;
+                            self.emit(Event::Auth(AuthStatus::SignedOut));
                         }
                     }
                 }
@@ -2897,14 +2988,15 @@ impl Worker {
                         }
                         self.on_web_signed_in(source, token);
                     } else {
-                        // Signing in renews only the shared app's grant, so a
-                        // personal app has to be authorized again where it was
-                        // set up (#634).
+                        // A shared grant cannot be renewed any more, and a
+                        // personal app's is renewed by signing in with it, or
+                        // in Settings while a shared grant keeps the app
+                        // signed in (#634).
                         let message = if source == ApiSource::Shared {
-                            "Spotify permissions changed. Sign in again."
+                            "Spotify permissions changed. Sign in with your own Spotify app."
                         } else {
-                            "Spotify permissions changed for your personal app. \
-                             Authorize it again in Settings, under Account."
+                            "Spotify permissions changed for your personal app. Authorize it \
+                             again, with Sign in or in Settings, under Account."
                         };
                         self.emit(Event::Error(message.into()));
                     }
@@ -3025,6 +3117,9 @@ impl Worker {
         } else {
             self.api.clear(source);
         }
+        if source == ApiSource::Shared {
+            self.emit(Event::SharedGrant(false));
+        }
         let message = match source {
             ApiSource::Shared => format!("Shared Spotify sign-in failed: {error}"),
             ApiSource::Personal => format!("Personal app authorization failed: {error}"),
@@ -3036,9 +3131,27 @@ impl Worker {
                 SessionState::Ready { .. }
             ),
         };
-        if source == ApiSource::Shared || !other_ready {
+        let problem = match (source, &error) {
+            (ApiSource::Shared, ApiError::SignInExpired { .. }) => {
+                Some(SignInProblem::SharedRetired)
+            }
+            // Development Mode lets in only the accounts the app's owner
+            // allows, and none while the owner has no Premium.
+            (ApiSource::Personal, error) if error.status() == Some(403) => {
+                Some(SignInProblem::AccountNotAllowed)
+            }
+            (ApiSource::Personal, ApiError::SignInExpired { .. }) => Some(SignInProblem::Expired),
+            _ => None,
+        };
+        if !other_ready {
             self.signed_in = false;
-            self.emit(Event::Auth(AuthStatus::Failed(message.clone())));
+            self.emit(Event::Auth(match problem {
+                Some(problem) => AuthStatus::Refused(problem),
+                None => AuthStatus::Failed(message.clone()),
+            }));
+            if problem.is_some() {
+                return;
+            }
         }
         self.emit(Event::Error(message));
     }
@@ -3092,6 +3205,7 @@ impl Worker {
         }
         match source {
             ApiSource::Shared => {
+                self.emit(Event::SharedGrant(true));
                 if !self.signed_in {
                     self.signed_in = true;
                     self.emit(Event::Auth(AuthStatus::Connected {
@@ -3140,8 +3254,28 @@ impl Worker {
         }
     }
 
-    fn sign_in(&mut self) {
-        self.sign_in_source(ApiSource::Shared);
+    /// The sign-in screen's button: with the listener's own app, the only
+    /// way to sign in. Shared access takes no new sign-ins.
+    fn sign_in(&mut self, client_id: Option<String>) {
+        let client_id = client_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        if !client_id
+            .as_deref()
+            .is_some_and(crate::auth::looks_like_client_id)
+        {
+            self.emit(Event::Auth(AuthStatus::Refused(
+                SignInProblem::MalformedClientId,
+            )));
+            return;
+        }
+        if client_id != self.web_client_id {
+            // The same steps as choosing another app in Settings, which also
+            // starts its sign-in.
+            self.configure_personal_web_app(client_id);
+        } else {
+            self.sign_in_source(ApiSource::Personal);
+        }
     }
 
     fn sign_in_source(&mut self, source: ApiSource) {
@@ -3155,25 +3289,27 @@ impl Worker {
         if self.cancel_signin.is_some() {
             return;
         }
-        let grant = match source {
-            ApiSource::Shared => crate::auth::Grant::shared_web_api(),
-            ApiSource::Personal => {
-                let Some(client_id) = self.web_client_id.as_deref() else {
-                    return;
-                };
-                match crate::auth::Grant::personal_web_api(client_id) {
-                    Ok(grant) => grant,
-                    Err(error) => {
-                        self.emit(Event::Error(error.to_string()));
-                        return;
-                    }
-                }
+        // Signing in from the sign-in screen, rather than authorizing a
+        // personal app in Settings while already signed in.
+        let primary = !self.signed_in;
+        // A shared grant is only ever restored, never made.
+        if source == ApiSource::Shared {
+            return;
+        }
+        let Some(client_id) = self.web_client_id.as_deref() else {
+            return;
+        };
+        let grant = match crate::auth::Grant::personal_web_api(client_id) {
+            Ok(grant) => grant,
+            Err(error) => {
+                self.emit(Event::Error(error.to_string()));
+                return;
             }
         };
         let listener = match crate::auth::listen_for_redirect(grant.redirect_port) {
             Ok(listener) => listener,
             Err(error) => {
-                if source == ApiSource::Shared {
+                if primary {
                     self.emit(Event::Auth(AuthStatus::Failed(error.to_string())));
                 } else {
                     self.emit(Event::Error(error.to_string()));
@@ -3191,21 +3327,41 @@ impl Worker {
         self.cancel_signin = Some(cancel_tx);
         self.authorizing_source = Some(source);
         self.api.set_state(source, SessionState::Authorizing);
-        if source == ApiSource::Shared {
+        if primary {
             self.emit(Event::Auth(AuthStatus::WaitingForBrowser {
                 url: flow.url.clone(),
             }));
         }
         let browser_url = flow.url.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = crate::opener::open(&browser_url) {
-                log::warn!("unable to open a browser: {error}");
-            }
-        });
         let events = self.events.clone();
         let waker = self.waker.clone();
         let commands = self.commands.clone();
         tokio::spawn(async move {
+            // A Client ID Spotify never issued would stop on Spotify's page
+            // in the browser, which never tells the app. Ask first.
+            if crate::auth::client_known(&http, &grant.client_id).await == Some(false) {
+                if lease.current() {
+                    let _ = events.send(if primary {
+                        Event::Auth(AuthStatus::Refused(SignInProblem::UnknownClient))
+                    } else {
+                        Event::Error(
+                            "Spotify doesn't know this Client ID. Copy it again from your \
+                             app's page in Spotify's developer dashboard."
+                                .into(),
+                        )
+                    });
+                    waker.wake();
+                }
+                let _ = commands.send(Command::SignInEnded { source, attempt });
+                return;
+            }
+            if lease.current() {
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = crate::opener::open(&browser_url) {
+                        log::warn!("unable to open a browser: {error}");
+                    }
+                });
+            }
             let result = async {
                 let code = crate::auth::wait_for_code_on_listener(listener, &flow.state, cancel_rx)
                     .await?;
@@ -3224,7 +3380,7 @@ impl Worker {
                     });
                 }
                 Err(error) => {
-                    if lease.current() && source == ApiSource::Shared {
+                    if lease.current() && primary {
                         let _ = events.send(Event::Auth(AuthStatus::SignedOut));
                     }
                     let message = error.to_string();
@@ -4571,10 +4727,21 @@ impl Worker {
         let cache_dir = self.dirs.lyrics_cache_dir();
         let engine = self.engine.clone();
         tokio::spawn(async move {
-            // Spotify's own words go first: they follow the recording
-            // exactly. Everything else, a signed-out session included,
-            // falls back to LRCLIB.
-            let result = match spotify_lyrics(engine, &request.uri, &cache_dir).await {
+            // A local file's own words go first, then Spotify's: they
+            // follow the recording exactly. Everything else, a signed-out
+            // session included, falls back to LRCLIB.
+            let own = match request.local_file {
+                Some(file) => tokio::task::spawn_blocking(move || crate::local_tags::lyrics(&file))
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            let exact = match own {
+                Some(found) => Some(found),
+                None => spotify_lyrics(engine, &request.uri, &cache_dir).await,
+            };
+            let result = match exact {
                 Some(found) => Ok(Some(found)),
                 None => match http {
                     Ok(http) => crate::lyrics::fetch(&http, &cache_dir, &request.query)
@@ -4740,7 +4907,9 @@ impl Worker {
         if query.is_empty() {
             return;
         }
-        let split = self.api.personal_ready();
+        // Splitting moves playlists to shared access; without it, one request
+        // to the personal app asks for everything.
+        let split = self.api.personal_ready() && self.api.has_shared();
         self.emit(Event::Api(Box::new(ApiResponse::SearchStarted {
             query: query.clone(),
             serial,
@@ -4918,9 +5087,8 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
             Operation::PlaylistMutation(api.playlist_access(playlist_id))
         }
         ApiRequest::ArtistTopTracks { .. } => Operation::ArtistTopTracks,
-        ApiRequest::Recommendations { .. } | ApiRequest::RelatedArtists { .. } => {
-            Operation::UnsupportedDevelopmentMode
-        }
+        ApiRequest::RelatedArtists { .. } => Operation::RelatedArtists,
+        ApiRequest::Recommendations { .. } => Operation::UnsupportedDevelopmentMode,
         ApiRequest::Artist { .. }
         | ApiRequest::ArtistAlbums { .. }
         | ApiRequest::Album { .. }
@@ -5374,7 +5542,8 @@ async fn handle(
             } else {
                 None
             };
-            over_session(engine, http, &request, account_id.clone()).await
+            let web = api.prerelease_http_client();
+            over_session(engine, http, web.as_deref(), &request, account_id.clone()).await
         };
         if let Some(response) = response {
             log::debug!("Spotify route operation={operation:?} source=session");
@@ -5428,11 +5597,17 @@ async fn handle(
             result: routed!(recently_played(limit, None, before.as_deref())),
         },
         ApiRequest::TopTracks {
+            period,
             offset,
             full,
             generation,
         } => ApiResponse::TopTracks {
-            result: routed!(top_tracks("short_term", if full { 50 } else { 20 }, offset)),
+            result: routed!(top_tracks(
+                period.as_spotify(),
+                if full { 50 } else { 20 },
+                offset
+            )),
+            period,
             offset,
             full,
             generation,
@@ -5791,7 +5966,7 @@ async fn handle(
                 RemoteAction::Next => routed!(next(device)),
                 RemoteAction::Previous => routed!(previous(device)),
                 RemoteAction::Seek => routed!(seek(position_ms, device)),
-                RemoteAction::Volume => routed!(set_volume(percent, device)),
+                RemoteAction::Volume { .. } => routed!(set_volume(percent, device)),
                 RemoteAction::Shuffle => routed!(set_shuffle(flag, device)),
                 RemoteAction::Repeat => routed!(set_repeat(&repeat, device)),
             };
@@ -5998,11 +6173,12 @@ async fn library_over_session(api: &ApiGateway, operation: Operation) -> bool {
     operation == Operation::PlaylistLibrary && !api.shared_available().await
 }
 
-/// Answers a playlist or popular-track read over the streaming session. `None` when the
+/// Answers a supported read over the streaming session. `None` when the
 /// session could not, leaving the request to the Web API.
 async fn over_session(
     engine: &Engine,
     http: &Http,
+    web: Option<&ApiClient>,
     request: &ApiRequest,
     account_id: Option<String>,
 ) -> Option<ApiResponse> {
@@ -6028,9 +6204,6 @@ async fn over_session(
             } => SessionAnswer::Albums(settle(
                 session_reads::artist_albums(session, id, groups, offset, ARTIST_ALBUMS_PAGE_SIZE)
                     .await,
-            )?),
-            SessionRead::RelatedArtists { id } => SessionAnswer::Artists(settle(
-                session_reads::related_artists(session, id).await,
             )?),
             SessionRead::Search { query } => {
                 SessionAnswer::Results(settle(
@@ -6132,6 +6305,9 @@ async fn over_session(
             SessionRead::ArtistTop { id } => SessionAnswer::ArtistTop(settle(
                 session_reads::artist_top_tracks(session, id).await,
             )?),
+            SessionRead::RelatedArtists { id } => SessionAnswer::RelatedArtists(settle(
+                session_reads::related_artists(session, web?, id).await,
+            )?),
             SessionRead::Library => {
                 SessionAnswer::Library(settle(session_reads::library(session).await)?)
             }
@@ -6157,11 +6333,11 @@ async fn over_session(
     session_response(request, answer?, account_id)
 }
 
-/// The read a request asks of the session: a playlist's header, a page of
-/// its rows, or a sample of who added them, which needs no song details;
-/// one part of an artist's page, a search, the playlist list, or the liked
-/// songs. Anything else, a duplicate check among them, is the Web API's
-/// even where the session serves the operation.
+/// The read a request asks of the session: artist cards or popular tracks,
+/// a playlist's header, a page of its rows, or a sample of who added them,
+/// which needs no song details; one part of an artist's page, a search, the
+/// playlist list, or the liked songs. Anything else, a duplicate check among
+/// them, is the Web API's even where the session serves the operation.
 #[derive(Debug, PartialEq)]
 enum SessionRead<'a> {
     ArtistTop {
@@ -6223,6 +6399,7 @@ enum SessionRead<'a> {
 
 fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
     Some(match request {
+        ApiRequest::RelatedArtists { id } => SessionRead::RelatedArtists { id },
         ApiRequest::ArtistTopTracks { id } => SessionRead::ArtistTop { id },
         ApiRequest::Playlist { id, .. } => SessionRead::Header { id },
         ApiRequest::PlaylistItems { id, offset, .. } => SessionRead::Rows {
@@ -6239,7 +6416,6 @@ fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
             groups,
             offset: *offset,
         },
-        ApiRequest::RelatedArtists { id } => SessionRead::RelatedArtists { id },
         ApiRequest::Search { query, .. }
         | ApiRequest::SearchCatalogue { query, .. }
         | ApiRequest::SearchPlaylists { query, .. } => SessionRead::Search { query },
@@ -6305,7 +6481,7 @@ fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
                 RemoteAction::Next => Command::Next,
                 RemoteAction::Previous => Command::Previous,
                 RemoteAction::Seek => Command::Seek(*position_ms),
-                RemoteAction::Volume => Command::Volume(*percent),
+                RemoteAction::Volume { .. } => Command::Volume(*percent),
                 RemoteAction::Shuffle => Command::Shuffle(*flag),
                 RemoteAction::Repeat => Command::Repeat(repeat),
             };
@@ -6327,17 +6503,16 @@ fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
     })
 }
 
-/// What the session read: a playlist's header, a page of its rows, the
-/// whole playlist library, a part of an artist's page, or the results of a
-/// search.
+/// What the session read: artist cards or tracks, a playlist's header, a page
+/// of its rows, the whole playlist library, a part of an artist's page, or the
+/// results of a search.
 enum SessionAnswer {
+    RelatedArtists(ApiResult<Vec<Artist>>),
     ArtistTop(ApiResult<Vec<Track>>),
     Header(Box<ApiResult<Playlist>>),
     Rows(ApiResult<Page<PlaylistItem>>),
     Artist(ApiResult<Artist>),
-    Tracks(ApiResult<Vec<Track>>),
     Albums(ApiResult<Page<Album>>),
-    Artists(ApiResult<Vec<Artist>>),
     Results(ApiResult<SearchResults>),
     Saved(ApiResult<Page<SavedTrack>>),
     Flags(ApiResult<Vec<bool>>),
@@ -6369,6 +6544,12 @@ fn session_response(
     account_id: Option<String>,
 ) -> Option<ApiResponse> {
     Some(match (request, answer) {
+        (ApiRequest::RelatedArtists { id }, SessionAnswer::RelatedArtists(result)) => {
+            ApiResponse::RelatedArtists {
+                id: id.clone(),
+                result,
+            }
+        }
         (ApiRequest::ArtistTopTracks { id }, SessionAnswer::ArtistTop(result)) => {
             ApiResponse::ArtistTopTracks {
                 id: id.clone(),
@@ -6411,12 +6592,6 @@ fn session_response(
                 id: id.clone(),
                 groups: groups.clone(),
                 offset: *offset,
-                result,
-            }
-        }
-        (ApiRequest::RelatedArtists { id }, SessionAnswer::Artists(result)) => {
-            ApiResponse::RelatedArtists {
-                id: id.clone(),
                 result,
             }
         }
@@ -8059,7 +8234,7 @@ mod authorization_tests {
         worker.engine_proxy = Some(old_url.clone());
         worker.signed_in = true;
         worker.engine_busy = true;
-        worker.change_proxy(1, ProxyConfig::Off, false);
+        worker.change_proxy(1, ProxyConfig::Off, None);
         assert!(
             worker.engine_restart_pending,
             "Off must discard an in-flight connection using the former system proxy"
@@ -8222,7 +8397,7 @@ mod authorization_tests {
         let _entered = runtime.enter();
         worker.restoring_proxy = true;
         let old = worker.credentials.lease(CredentialSlot::Proxy);
-        worker.change_proxy(1, ProxyConfig::System, false);
+        worker.change_proxy(1, ProxyConfig::System, None);
         assert!(!worker.restoring_proxy);
         assert!(worker.http.client().is_ok());
         worker.on_proxy_restored(
@@ -8270,7 +8445,7 @@ mod authorization_tests {
         let _entered = runtime.enter();
         let original = worker.engine_config.proxy.clone();
         let bad = ProxyConfig::Invalid("Proxy port must be a number".into());
-        worker.change_proxy(1, bad.clone(), false);
+        worker.change_proxy(1, bad.clone(), None);
         assert_eq!(worker.engine_config.proxy, original);
         assert!(!worker.engine_restart_pending);
         assert!(worker.http.client().is_ok());
@@ -8288,7 +8463,7 @@ mod authorization_tests {
             verify(&mut worker, ApiSource::Shared, "alice");
             let old = worker.credentials.lease(CredentialSlot::Shared);
             let grant = StoredGrant::Web(crate::auth::StoredToken {
-                client_id: crate::auth::DEFAULT_WEB_CLIENT_ID.into(),
+                client_id: "dummy-shared-client".into(),
                 access_token: "dummy-expired-access".into(),
                 refresh_token: "dummy-rejected-refresh".into(),
                 ..Default::default()
@@ -8321,6 +8496,176 @@ mod authorization_tests {
                     .any(|event| matches!(event, Event::Auth(AuthStatus::Connected { .. })))
             );
         });
+    }
+
+    /// Spotify refusing the shared grant of a listener who also has a
+    /// personal app leaves them signed in with it; refusing the personal
+    /// app's grant too, the last one, signs them out.
+    #[test]
+    fn a_refused_shared_grant_leaves_the_personal_app_signed_in() {
+        let (runtime, mut worker, events) = worker("refused-shared-keeps-personal");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        verify(&mut worker, ApiSource::Personal, "alice");
+        let _ = events.try_iter().collect::<Vec<_>>();
+        let finished = |worker: &Worker, expired: ApiSource| Command::ApiFinished {
+            generation: *worker.session.borrow(),
+            home_account: None,
+            response: Box::new(ApiResponse::Me(Err(ApiError::SignInExpired {
+                api_source: expired,
+            }))),
+            expired: vec![expired],
+            shared_lease: worker.credentials.lease(CredentialSlot::Shared),
+            personal_lease: worker.credentials.lease(CredentialSlot::Personal),
+        };
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands.send(finished(&worker, ApiSource::Shared)).unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+        assert!(worker.signed_in);
+        assert!(!worker.api.has_shared());
+        assert!(worker.api.personal_ready());
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, Event::Auth(AuthStatus::Failed(_))))
+        );
+
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands
+            .send(finished(&worker, ApiSource::Personal))
+            .unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+        assert!(!worker.signed_in);
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            Event::Auth(AuthStatus::Refused(SignInProblem::Expired))
+        )));
+    }
+
+    /// The sign-in screen's button signs in with the Client ID typed there,
+    /// and its problems show on that screen rather than as a toast behind
+    /// it. What cannot be a Client ID never reaches the browser, and shared
+    /// access takes no new sign-ins.
+    #[test]
+    fn the_sign_in_screen_signs_in_with_the_listeners_own_app() {
+        let _turn = WEB_PORT.lock().unwrap_or_else(|poison| poison.into_inner());
+        let (runtime, mut worker, events) = worker("sign-in-with-personal");
+        let _entered = runtime.enter();
+        let _occupied =
+            std::net::TcpListener::bind(("127.0.0.1", crate::auth::WEB_REDIRECT_PORT)).unwrap();
+        for typed in [
+            None,
+            Some("".into()),
+            Some("https://developer.spotify.com".into()),
+        ] {
+            worker.sign_in(typed);
+            let received: Vec<_> = events.try_iter().collect();
+            assert!(received.iter().any(|event| matches!(
+                event,
+                Event::Auth(AuthStatus::Refused(SignInProblem::MalformedClientId))
+            )));
+            assert_eq!(worker.authorization_attempt, 0);
+        }
+
+        worker.sign_in_source(ApiSource::Shared);
+        assert!(worker.cancel_signin.is_none());
+        assert_eq!(
+            worker.api.state(ApiSource::Shared),
+            SessionState::Unavailable
+        );
+
+        let id = "0123456789abcdef0123456789abcdef";
+        worker.sign_in(Some(format!(" {id} ")));
+        assert_eq!(worker.web_client_id.as_deref(), Some(id));
+        let received: Vec<_> = events.try_iter().collect();
+        assert!(received.iter().any(|event| matches!(event,
+            Event::Auth(AuthStatus::Failed(message)) if message.contains("8989")
+        )));
+        assert!(
+            !received
+                .iter()
+                .any(|event| matches!(event, Event::Error(_)))
+        );
+        assert_eq!(
+            worker.api.state(ApiSource::Shared),
+            SessionState::Unavailable
+        );
+    }
+
+    /// Choosing another app in Settings while it is the only grant, and
+    /// never finishing its sign-in, returns to the sign-in screen rather
+    /// than leaving an app that nothing answers.
+    #[test]
+    fn an_unfinished_switch_of_the_only_app_returns_to_sign_in() {
+        let (runtime, mut worker, events) = worker("unfinished-switch");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Personal, "alice");
+        worker.api.clear(ApiSource::Personal);
+        worker.authorizing_source = Some(ApiSource::Personal);
+        let _ = events.try_iter().collect::<Vec<_>>();
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands
+            .send(Command::SignInEnded {
+                source: ApiSource::Personal,
+                attempt: worker.authorization_attempt,
+            })
+            .unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+        assert!(!worker.signed_in);
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Auth(AuthStatus::SignedOut)))
+        );
+    }
+
+    /// Spotify refusing the shared grant with nothing else signed in sends
+    /// the listener to set up their own app, and says why; a personal app
+    /// that does not let the account in says that instead.
+    #[test]
+    fn refusals_say_what_to_do() {
+        let (runtime, mut worker, events) = worker("refusals");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        worker.on_web_verification_failed(
+            ApiSource::Shared,
+            ApiError::SignInExpired {
+                api_source: ApiSource::Shared,
+            },
+        );
+        let received: Vec<_> = events.try_iter().collect();
+        assert!(received.iter().any(|event| matches!(
+            event,
+            Event::Auth(AuthStatus::Refused(SignInProblem::SharedRetired))
+        )));
+        assert!(
+            received
+                .iter()
+                .any(|event| matches!(event, Event::SharedGrant(false)))
+        );
+        assert!(
+            !received
+                .iter()
+                .any(|event| matches!(event, Event::Error(_)))
+        );
+
+        worker
+            .api
+            .set_state(ApiSource::Personal, SessionState::Authorizing);
+        worker.on_web_verification_failed(
+            ApiSource::Personal,
+            ApiError::Status {
+                status: 403,
+                message: "Check settings on developer.spotify.com/dashboard".into(),
+            },
+        );
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            Event::Auth(AuthStatus::Refused(SignInProblem::AccountNotAllowed))
+        )));
     }
 
     #[test]
@@ -8667,14 +9012,18 @@ mod authorization_tests {
         (runtime, worker, events)
     }
 
+    /// Tests that bind the personal app's callback port take turns.
+    static WEB_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn occupied_login_port_reports_persistent_failure_before_browser_sign_in() {
+        let _turn = WEB_PORT.lock().unwrap_or_else(|poison| poison.into_inner());
         let (runtime, mut worker, events) = worker("occupied-login-port");
         let _entered = runtime.enter();
         let _occupied =
             std::net::TcpListener::bind(("127.0.0.1", crate::auth::WEB_REDIRECT_PORT)).unwrap();
         for _ in 0..2 {
-            worker.sign_in_source(ApiSource::Shared);
+            worker.sign_in_source(ApiSource::Personal);
             let received: Vec<_> = events.try_iter().collect();
             assert!(received.iter().any(|event| matches!(event,
                 Event::Auth(AuthStatus::Failed(message)) if message.contains("8989")
@@ -8998,7 +9347,7 @@ mod authorization_tests {
             let lease = worker.credentials.lease(slot);
             let token = crate::auth::StoredToken {
                 client_id: if slot == CredentialSlot::Shared {
-                    crate::auth::DEFAULT_WEB_CLIENT_ID.into()
+                    "dummy-shared-client".into()
                 } else {
                     "personal".into()
                 },
@@ -9022,12 +9371,13 @@ mod authorization_tests {
             assert!(worker.web_tokens[slot.index()].is_none());
             assert!(!worker.signed_in);
             let emitted: Vec<_> = events.try_iter().collect();
-            // Signing in renews the shared app; a personal app is renewed only
-            // by authorizing it again in Settings (#634).
+            // A shared grant cannot be renewed, so it points at the
+            // listener's own app; a personal app is renewed by signing in
+            // with it, or in Settings (#634).
             let advice = if slot == CredentialSlot::Shared {
-                "Sign in again."
+                "Sign in with your own Spotify app."
             } else {
-                "Authorize it again in Settings, under Account."
+                "with Sign in or in Settings, under Account."
             };
             assert!(emitted.iter().any(|event| matches!(event,
                 Event::Error(message)
@@ -9051,7 +9401,7 @@ mod authorization_tests {
         let attempt = worker.authorization_attempt;
         let album_type_session = worker.album_type_lookup.session_generation;
         let token = crate::auth::StoredToken {
-            client_id: crate::auth::DEFAULT_WEB_CLIENT_ID.into(),
+            client_id: "dummy-shared-client".into(),
             access_token: "dummy-access".into(),
             refresh_token: "dummy-refresh".into(),
             ..Default::default()
@@ -9244,7 +9594,7 @@ mod authorization_tests {
                 client_id: if source == ApiSource::Personal {
                     "personal"
                 } else {
-                    crate::auth::DEFAULT_WEB_CLIENT_ID
+                    "dummy-shared-client"
                 }
                 .into(),
                 ..Default::default()
@@ -9600,6 +9950,41 @@ mod session_tests {
             }
         ));
         assert!(expired.is_empty());
+    }
+
+    /// Related artists are read over the session first, and a session error
+    /// keeps the Web API fallback.
+    #[test]
+    fn related_artists_can_bypass_the_shared_web_api() {
+        let api = ApiGateway::new(reqwest::Client::new(), Arc::new(NetActivity::default()));
+        let request = ApiRequest::RelatedArtists {
+            id: "artist1".into(),
+        };
+        assert!(
+            api.session_serves(operation_for(&api, &request)),
+            "a playback session must serve related artists before Shared quota"
+        );
+        assert!(
+            session_read(&request).is_some(),
+            "the eligible request needs a real session read"
+        );
+        assert_eq!(operation_for(&api, &request), Operation::RelatedArtists);
+        assert_eq!(
+            session_read(&request),
+            Some(SessionRead::RelatedArtists { id: "artist1" })
+        );
+        assert!(matches!(
+            session_response(&request, SessionAnswer::RelatedArtists(Ok(Vec::new()))),
+            Some(ApiResponse::RelatedArtists { id, result: Ok(artists) })
+                if id == "artist1" && artists.is_empty()
+        ));
+        assert!(
+            settle(Err::<Vec<Artist>, Failure>(Failure::Retry(
+                anyhow::anyhow!("private read unavailable")
+            )))
+            .is_none(),
+            "a transient session error must retain Web API fallback"
+        );
     }
 
     /// Popular-track responses retain artist identity and the existing fallback/error policy.

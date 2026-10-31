@@ -32,16 +32,27 @@ Spotifast uses the Web API for:
   next, previous, seek, shuffle, repeat, volume, and reading or adding to the
   queue.
 
-Users of the default app share Spotify's quota. Spotifast limits heavy
-requests and pauses a session when Spotify sends a `Retry-After` response.
+Since 0.14.2, Web API requests go through the listener's own Spotify app,
+registered for free in Spotify's developer dashboard
+([Getting Started](/getting-started/#make-a-spotify-app)). Spotify grants no
+app the quota to serve everyone: an app in Development Mode lets in at most
+five accounts, and an extension needs a registered business with hundreds of
+thousands of monthly listeners. Spotify's desktop client identity, the one
+librespot streams with, signs in to the Web API, but every request it makes
+there is answered with "too many requests" from the first one (tried
+2026-10-25). Spotifast limits heavy requests and pauses a session when
+Spotify sends a `Retry-After` response.
+[Spotify is being slow](/troubleshooting/#rate-limits) explains it for
+listeners.
 
 Spotify also limits apps created since November 2024. These apps cannot access
 Spotify-owned playlists, related artists, recommendations, or audio features.
-This is why a personal app cannot handle every request. Complete playlist
-library views stay on the shared app, or come from the librespot session's
-rootlist while the shared app cannot answer. Playlists other people own, and
-every playlist when there is no personal app, are read over the librespot
-session while local playback is signed in. See [How It Connects](/how-it-connects/).
+This is why the personal app cannot handle every request. Complete playlist
+library views come from the librespot session's rootlist while local playback
+is signed in, and from a shared grant made before 0.14.2 while one is still
+signed in. Playlists other people own, and every playlist when there is no
+personal app, are read over the librespot session while local playback is
+signed in. See [How It Connects](/how-it-connects/).
 
 ## librespot session
 
@@ -53,9 +64,9 @@ clients. Spotifast uses its session for:
 - **Playlist permissions.** The rootlist shows when a playlist shared by
   invitation can be edited. The Web API's `collaborative` flag does not cover
   these playlists. Spotifast cannot manage collaborators.
-- **Playlists the shared app would otherwise serve.** Title, cover, and
-  songs of other people's playlists, and of the account's own when there is
-  no personal app, so they open without the shared app's quota. Whether a
+- **Playlists a personal app cannot read.** Title, cover, and songs of
+  other people's playlists, Spotify's own among them, and of the account's
+  own when there is no personal app, so they open without a Web API quota. Whether a
   playlist is public, the owner's name when the session gives none, and the
   mosaic of a playlist without a cover of its own, come from the Web API's
   library list. These rows carry
@@ -83,8 +94,12 @@ clients. Spotifast uses its session for:
   every copy.
 - **Lyrics** when Spotify has them.
 - **Artist popular tracks.** The account's market-specific ranking and batched
-  track details, with the shared Web API as fallback when the session cannot
+  track details, with the Web API as fallback when the session cannot
   supply them. This uses librespot's existing metadata support.
+- **Related artists** through the private `queryArtistRelated` request used by
+  Spotify's own clients, with the session's Login5 bearer and client token.
+  It uses the configured HTTP transport and falls back to the Web API, which
+  answers only a shared grant from before 0.14.2, if that read is unavailable. A different account's session is never used.
 - **Upcoming album pages.** Prerelease metadata supplies the real album mapping,
   cover and release time. Pathfinder supplies ordered preview rows and explicit
   playability; unpublished rows stay visible without entering playback. The
@@ -96,8 +111,8 @@ clients. Spotifast uses its session for:
 - **Precise EP types** for releases that the Web API groups with singles.
 - **Made for you** through Spotify's personalized Home section. This private
   request uses the playback session and an already verified Web API grant;
-  when it succeeds, it does not spend the shared app's playlist-search quota.
-  If it fails, the shared Web API can supply approximate playlist-name search
+  when it succeeds, it does not spend the Web API's playlist-search quota.
+  If it fails, a Web API playlist-name search can supply approximate
   results in the same **Made for you** shelf. Spotify may change the private Home
   response without a Web API version change.
 - **Your top mixes** through the same personalized Home read, from Spotify's
@@ -162,21 +177,40 @@ librespot provides:
   in Settings and its subfolders. Spotify keeps only a local file's artist,
   album, title and length, so the player matches each `spotify:local:` entry
   to the MP3, MP4, M4P or FLAC file whose tags and length give the same.
-  Only 44.1 kHz files play. The player reads the folder when local playback
-  starts, so songs added later play after the next restart. See
-  [issue #3](https://github.com/crmne/spotifast/issues/3).
+  Files at any sample rate from 8 to 384 kHz play, mono and surround
+  included: librespot resamples them to 44.1 kHz stereo
+  ([librespot#1840](https://github.com/librespot-org/librespot/pull/1840)).
+  The player reads the folder when local playback starts, so songs added
+  later play after the next restart. See
+  [issue #3](https://github.com/crmne/spotifast/issues/3). Spotify's queue
+  refuses a `spotify:local:` entry, so such a song is queued on this
+  computer's own player, and only while it plays
+  ([issue #1002](https://github.com/crmne/spotifast/issues/1002)). Spotify
+  has no cover or lyrics for a local file either, so Spotifast reads them
+  from the file: the picture in its tags (an MP3's ID3 `APIC` frame or a
+  FLAC `PICTURE` block), and the words in a `.lrc` file of the same name
+  beside it or in its tags (ID3 `USLT` or a `LYRICS` comment), before
+  asking LRCLIB
+  ([issue #1001](https://github.com/crmne/spotifast/issues/1001)).
 
 Spotify Premium is required. librespot cannot play audio with a free account.
 
 Spotifast uses a small librespot fork: librespot's development branch with a
 few patches that are also proposed upstream, such as normalisation data for the
-visualisers and an event for rejected audio keys. They are listed in
+visualisers and an event for rejected audio keys. When Spotify refuses an
+audio key, nothing in Spotifast can fix it; see
+[Spotify refused the audio key](/troubleshooting/#audio-key). The patches are listed in
 `Cargo.toml` and dropped as librespot merges them.
 
 ## Not available
 
 The Web API and librespot do not provide these features:
 
+- **One Web API app for every listener.** Spotify no longer extends an app
+  beyond Development Mode's five accounts for a project like this one, and
+  its desktop client identity is turned away from the Web API with "too many
+  requests". Each listener registers a free app of their own instead, which
+  needs Premium on the account that creates it.
 - **Pins shared with the Spotify app.** Spotify stores pins in its private
   `your-library` service. There is no Web API for it, and librespot does not
   support its protocol. Spotifast's pins are local and are stored in

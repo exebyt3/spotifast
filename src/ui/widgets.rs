@@ -705,22 +705,26 @@ pub fn picked_menu(
     });
     ui.add_space(4.0);
     menu_separator(ui, &palette);
+    // Local files queue only on this computer's player (#1002); the
+    // others in the selection still go.
+    let queueable = songs.iter().any(|item| app.can_queue(item.uri()));
     if menu_item_enabled(
         ui,
         &palette,
         Some(Icon::SkipForward),
         &gettext(locale, "Play next"),
-        app.queue_locally_reorderable(),
+        app.queue_locally_reorderable() && queueable,
     ) {
         app.actions.push(Action::PlayNext {
             items: songs.to_vec(),
         });
     }
-    if menu_item(
+    if menu_item_enabled(
         ui,
         &palette,
         Some(Icon::ListEnd),
         &gettext(locale, "Add to queue"),
+        queueable,
     ) {
         app.actions.push(Action::QueueMany {
             songs: songs
@@ -963,22 +967,25 @@ fn item_menu_at(
     ui.set_max_width(300.0);
     let uri = item.uri().to_string();
     let label = item.name().to_string();
+    // A local file queues only on this computer's player (#1002).
+    let queueable = app.can_queue(&uri);
     if menu_item_enabled(
         ui,
         &palette,
         Some(Icon::SkipForward),
         &gettext(locale, "Play next"),
-        app.queue_locally_reorderable(),
+        app.queue_locally_reorderable() && queueable,
     ) {
         app.actions.push(Action::PlayNext {
             items: vec![item.clone()],
         });
     }
-    if menu_item(
+    if menu_item_enabled(
         ui,
         &palette,
         Some(Icon::ListEnd),
         &gettext(locale, "Add to queue"),
+        queueable,
     ) {
         app.actions.push(Action::AddToQueue {
             uri: uri.clone(),
@@ -1543,7 +1550,7 @@ fn track_row_contents(
             ui.ctx(),
             DragTrack {
                 title: preview.name().to_string(),
-                image: preview.image(64).map(str::to_string),
+                image: app.item_image(preview, 64),
                 items,
                 from,
                 source_playlist,
@@ -1633,7 +1640,7 @@ fn track_row_contents(
         paint_cover(
             ui,
             &palette,
-            row.item.image(app.art_px(size)),
+            app.item_image(row.item, app.art_px(size)).as_deref(),
             cover_rect,
             4.0,
             if row.item.is_track() {
@@ -1732,8 +1739,8 @@ fn track_row_contents(
                 if let Some(added) = row.added_at.filter(|a| !a.starts_with("1970-01-01"))
                     && cols.added == 0.0
                 {
-                    let label =
-                        util::format_relative_date(app.locale, added, jiff::Timestamp::now());
+                    let now = jiff::Timestamp::now();
+                    let label = util::format_relative_date(app.locale, added, now);
                     theme::text(
                         &mut child,
                         "•",
@@ -1741,7 +1748,7 @@ fn track_row_contents(
                         palette.secondary.gamma_multiply(0.6),
                     );
                     theme::text(&mut child, &label, theme::regular(12.0), palette.secondary);
-                    if label.ends_with(" ago") {
+                    if util::is_relative_date(added, now) {
                         ui.ctx()
                             .request_repaint_after(std::time::Duration::from_secs(1));
                     }
@@ -1778,10 +1785,10 @@ fn track_row_contents(
                         theme::regular(12.0),
                         palette.secondary.gamma_multiply(0.6),
                     );
-                    let label =
-                        util::format_relative_date(app.locale, added, jiff::Timestamp::now());
+                    let now = jiff::Timestamp::now();
+                    let label = util::format_relative_date(app.locale, added, now);
                     theme::text(&mut child, &label, theme::regular(12.0), palette.secondary);
-                    if label.ends_with(" ago") {
+                    if util::is_relative_date(added, now) {
                         ui.ctx()
                             .request_repaint_after(std::time::Duration::from_secs(1));
                     }
@@ -1826,10 +1833,10 @@ fn track_row_contents(
                             theme::regular(12.0),
                             palette.secondary.gamma_multiply(0.6),
                         );
-                        let label =
-                            util::format_relative_date(app.locale, added, jiff::Timestamp::now());
+                        let now = jiff::Timestamp::now();
+                        let label = util::format_relative_date(app.locale, added, now);
                         theme::text(ui, &label, theme::regular(12.0), palette.secondary);
-                        if label.ends_with(" ago") {
+                        if util::is_relative_date(added, now) {
                             ui.ctx()
                                 .request_repaint_after(std::time::Duration::from_secs(1));
                         }
@@ -1857,10 +1864,10 @@ fn track_row_contents(
                             theme::regular(12.0),
                             palette.secondary.gamma_multiply(0.6),
                         );
-                        let label =
-                            util::format_relative_date(app.locale, added, jiff::Timestamp::now());
+                        let now = jiff::Timestamp::now();
+                        let label = util::format_relative_date(app.locale, added, now);
                         theme::text(ui, &label, theme::regular(12.0), palette.secondary);
-                        if label.ends_with(" ago") {
+                        if util::is_relative_date(added, now) {
                             ui.ctx()
                                 .request_repaint_after(std::time::Duration::from_secs(1));
                         }
@@ -1928,7 +1935,8 @@ fn track_row_contents(
             .filter(|added| !added.starts_with("1970-01-01"))
         {
             let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(cols.added, row_height));
-            let label = util::format_relative_date(app.locale, added, jiff::Timestamp::now());
+            let now = jiff::Timestamp::now();
+            let label = util::format_relative_date(app.locale, added, now);
             painter.text(
                 pos2(cell.left(), cell.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -1938,7 +1946,7 @@ fn track_row_contents(
             );
             // Relative labels cross a boundary while the table is idle, so
             // keep the visible value in step with the clock.
-            if label.ends_with(" ago") {
+            if util::is_relative_date(added, now) {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_secs(1));
             }

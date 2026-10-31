@@ -28,7 +28,8 @@ into one folder.
 
 Right-click the title bar, or click **O**, to choose a size from 1x to 4x.
 Each size keeps the classic pixels sharp. The same menu can keep the player
-above other windows. **D** toggles double size and **A** toggles always-on-top.
+above other windows. **D** steps through the sizes, 1x to 4x, and **A**
+toggles always-on-top.
 Spotifast remembers the window position where your desktop allows it.
 
 Skins can have transparent areas and shapes other than rectangles. Modern
@@ -49,8 +50,10 @@ Click the time to switch between elapsed and remaining time. The balance and
 MONO/STEREO controls affect playback on this computer. Quit from the
 right-click menu or with Ctrl+Q.
 
-The shade button, or a double-click on the title bar, rolls the player up. The
-playlist and equalizer have their own shade buttons.
+The shade button, or a double-click on the title bar, rolls the player up. Its
+tiny spectrum analyser or oscilloscope keeps moving in the collapsed bar;
+click the display to cycle through bars, waveform and off, just like the full
+player. The playlist and equalizer have their own shade buttons.
 
 Switching to the main window and back keeps the shade modes and restores the
 mini player's own position. It does not inherit the main window's fullscreen
