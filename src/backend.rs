@@ -69,9 +69,10 @@ const RECONNECT_LIMIT: usize = 6;
 const NEW_RELEASES_PER_ARTIST: u32 = 10;
 /// Seconds between background attempts to bring the engine back with the
 /// saved playback grant after a connection failure that was not a rejected
-/// grant (#818). The last delay repeats, so a session lost overnight comes
-/// back on its own at the cost of one connection attempt every ten minutes.
-const ENGINE_RETRY_DELAYS: [u64; 6] = [5, 15, 60, 120, 300, 600];
+/// grant (#818). The last delay repeats. Linux has no reachability signal,
+/// so the retries are what notices the internet is back: a failed attempt
+/// while it is down costs nothing, and the music returns within seconds.
+const ENGINE_RETRY_DELAYS: [u64; 4] = [2, 5, 10, 15];
 
 async fn connect_engine_with_deadline<F: std::future::Future>(
     connect: F,
@@ -4099,8 +4100,10 @@ impl Worker {
                     }
                     // A song still playing out a dropped session carries on
                     // through the retries, and the engine that connects
-                    // picks it up (#268). Anything else is forgotten.
-                    if !(retrying && self.kept_player.as_ref().is_some_and(KeptPlayer::has_song)) {
+                    // picks it up (#268). One that ran out of fetched audio
+                    // while the internet was down is picked up where the
+                    // session dropped, so music comes back with the network.
+                    if !retrying {
                         self.resume = None;
                         self.stop_kept_player();
                     }
@@ -9091,6 +9094,38 @@ mod authorization_tests {
         );
         assert_eq!(worker.engine_retries, 2);
         assert!(!worker.engine_retry_quiet);
+    }
+
+    /// A song whose player ran dry while the internet was down is not
+    /// forgotten by the failed reconnects: the engine that connects once the
+    /// network is back plays it again, with no app restart.
+    #[test]
+    fn failed_reconnects_keep_the_song_for_the_next_engine() {
+        let (runtime, mut worker, _events) = worker("engine-retry-keeps-song");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        worker.playback_grant = Some(Credentials::with_password("alice", "dummy-grant"));
+        let session = worker.album_type_lookup.session_generation;
+        let spec = LoadSpec {
+            uris: vec!["spotify:track:a".into()],
+            position_ms: 42_000,
+            play: true,
+            ..LoadSpec::default()
+        };
+        worker.resume = Some(PlaybackResume::Track(spec.clone()));
+        assert!(worker.kept_player.is_none());
+
+        for _ in 0..3 {
+            worker.connect_engine(Credentials::with_password("alice", "dummy-grant"));
+            worker.on_engine_connected(
+                session,
+                None,
+                Some("failed to lookup address information".into()),
+                worker.engine_attempt,
+            );
+        }
+        assert_eq!(worker.engine_retries, 3);
+        assert!(matches!(&worker.resume, Some(PlaybackResume::Track(kept)) if *kept == spec));
     }
 
     /// A rejected grant is not retried in the background, and nothing is

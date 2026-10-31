@@ -401,11 +401,6 @@ impl KeptPlayer {
         true
     }
 
-    /// Whether the player still has a song, playing or paused.
-    pub fn has_song(&self) -> bool {
-        self.now().is_some()
-    }
-
     /// Where the song is now and whether it plays, or `None` once the
     /// player has nothing left.
     fn now(&self) -> Option<Interrupted> {

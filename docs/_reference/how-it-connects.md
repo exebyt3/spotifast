@@ -612,8 +612,10 @@ looks up no name and sends nothing over the network.
 
 Since 0.13.2, a playback connection that fails while the network is up, for
 example with a connection reset after the computer wakes, is tried again with
-the saved playback approval: after 5 and 15 seconds, 1, 2 and 5 minutes, and
-then every 10 minutes until it connects. These attempts keep the error on
+the saved playback approval: after 2, 5 and 10 seconds, and then every 15
+seconds until it connects. Linux reports no reachability, so these attempts
+are what notice the internet is back, and the song that was playing when the
+connection dropped plays again where it stopped. These attempts keep the error on
 screen instead of flickering through "Connecting", and they stop when
 Spotify rejects the approval, playback is set up again, or you sign out.
 **Set up playback here** and **Try again** first reconnect with the saved
