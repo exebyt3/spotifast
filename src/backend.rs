@@ -9877,7 +9877,7 @@ mod authorization_tests {
         );
         assert!(worker.signed_in);
         let token = crate::auth::StoredToken {
-            client_id: crate::auth::DEFAULT_WEB_CLIENT_ID.into(),
+            client_id: "dummy-shared-client".into(),
             ..Default::default()
         };
         let user = |id: &str| User {
@@ -10009,7 +10009,7 @@ mod session_tests {
             Some(SessionRead::RelatedArtists { id: "artist1" })
         );
         assert!(matches!(
-            session_response(&request, SessionAnswer::RelatedArtists(Ok(Vec::new()))),
+            session_response(&request, SessionAnswer::RelatedArtists(Ok(Vec::new())), None),
             Some(ApiResponse::RelatedArtists { id, result: Ok(artists) })
                 if id == "artist1" && artists.is_empty()
         ));
