@@ -974,11 +974,13 @@ fn visualiser(app: &mut App, view: &mut View, now: Option<&NowPlaying>, area: Ar
         }
     }
     let row_at = |row: u8| u32::from(row) * area.height / u32::from(vis::ROWS);
-    let sounding = now.is_some_and(|now| (now.playing || now.loading) && now.local);
+    let sounding = app.visualizer_sounding(now);
     match mode {
         VisMode::Bars => {
             let samples = if sounding {
-                app.winamp.tap.window(vis::FFT_SAMPLES, vis::LAG)
+                app.winamp
+                    .tap
+                    .window(vis::FFT_SAMPLES, app.visualizer_lag())
             } else {
                 vec![0.0; vis::FFT_SAMPLES]
             };
@@ -1004,7 +1006,9 @@ fn visualiser(app: &mut App, view: &mut View, now: Option<&NowPlaying>, area: Ar
         }
         VisMode::Scope => {
             let samples = if sounding {
-                app.winamp.tap.window(vis::SCOPE_SAMPLES, vis::LAG)
+                app.winamp
+                    .tap
+                    .window(vis::SCOPE_SAMPLES, app.visualizer_lag())
             } else {
                 vec![0.0; vis::SCOPE_SAMPLES]
             };

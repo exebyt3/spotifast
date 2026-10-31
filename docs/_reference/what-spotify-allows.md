@@ -1,16 +1,17 @@
 ---
 title: What Spotify Lets a Client Do
-description: What Spotify's Web API and librespot provide, and what neither supports.
+description: What Spotify's APIs, librespot and Soloist provide, and where support ends.
 nav_order: 3
 ---
 
 Spotifast uses Spotify's
 [Web API](https://developer.spotify.com/documentation/web-api) for account and
 catalogue data. It uses [librespot](https://github.com/librespot-org/librespot)
-for a few extra details and for audio playback.
+for a few extra details and for built-in audio playback. The optional
+[Soloist player](/soloist/) adds Spotify's own playback implementation.
 
-Features missing from both cannot be added to Spotifast. They may become
-possible if Spotify adds an API or librespot adds lawful support.
+Features need support in the connection that serves them. A name in a
+protocol or an internal capability is not enough to expose a working control.
 
 ## Web API
 
@@ -159,6 +160,25 @@ queries, which librespot does not make, stay in Spotifast. Spotify can change
 any of these without notice, so a feature that uses one falls back to the Web
 API where it has an answer, and otherwise leaves out what it could not read.
 
+## Optional Soloist playback
+
+[Spotify Soloist](/soloist/) can be downloaded and managed from Settings.
+It supplies Spotify's own playback implementation on Linux, Apple Silicon
+macOS and x86_64 Windows. Each listener supplies a personal Soloist key and
+pairs once in the official Spotify app. Spotifast renews expiring builds
+from Spotify's download server and retains its existing library connections.
+Basic controls and state use Soloist's loopback API; collection offsets use
+the existing Spotify playback requests. Full queue editing and audio access
+remain unavailable through Soloist's documented API. On Linux with PipeWire,
+Spotifast processes its owned Soloist output through the operating system for
+EQ and visualizers; it does not capture the system mix.
+[Native audio support](/soloist/#native-audio) adds process-only Mac
+EQ and visualizers, and Windows visualizers. The Mac route applies Spotifast’s
+output volume after the visualizers and hold Soloist's source at 100% once
+redirected. Spotify/phone volume events change that output level before the
+source is reset, so Spotify's indicator returns to 100%. Windows capture
+follows source volume and cannot provide an audible EQ route.
+
 ## librespot playback
 
 librespot provides:
@@ -223,16 +243,11 @@ The Web API and librespot do not provide these features:
 - **Spotify DJ.** Its special playlist context does not expose playable tracks
   to librespot, so Spotifast leaves its card out of Made for you. See
   [librespot issue #1604](https://github.com/librespot-org/librespot/issues/1604).
-- **Lossless audio.** librespot does not receive lossless streams. Spotifast
-  will reconsider this if librespot gains lawful support, but it will not
-  bypass Spotify's DRM.
-- **Soloist as the player.** Spotify's Soloist plays lossless and works with
-  Spotify Connect, but Spotify ships it only for Linux and does not allow apps
-  to bundle it. Each listener would need their own developer key and pairing,
-  builds stop working after 90 days, and it has no API for the library,
-  playlists or search, and no way to feed the equalizer and visualisers.
-  Spotifast will reconsider it if Spotify offers a supported desktop path.
-  See [issue #965](https://github.com/crmne/spotifast/issues/965).
+- **Lossless through librespot.** librespot does not receive lossless streams.
+  The optional [Soloist player](/soloist/) uses Spotify's own implementation.
+  Its API does not report the delivered format or expose raw audio for
+  Spotifast's equalizer and visualisers. The Linux integration uses a private
+  PipeWire audio route instead. Spotifast does not bypass DRM.
 - **Local files from Spotify's Local Files playlist.** librespot cannot play
   that playlist; add the songs to another playlist first. Local files on other
   computers or phones are not shared either: Spotify keeps only their names.

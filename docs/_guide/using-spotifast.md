@@ -166,6 +166,10 @@ When you start a song from a sorted playlist or Liked Songs, it appears in
 the player bar straight away while playback connects. Sorting changes the
 order you hear without rearranging the playlist saved on Spotify.
 
+Local songs show readable titles, artists, and albums, including spaces and
+accented characters. Names saved in older playlist caches are corrected
+automatically when the cache is read.
+
 Sorted and filtered views omit unavailable songs and local files from playback.
 The rows stay visible, and selecting a repeated song starts that occurrence. Filtering a playlist or Liked Songs plays only the matching songs,
 including repeated entries. Play is disabled when the view has no playable
@@ -184,6 +188,12 @@ while it plays from a playlist you can edit.
 Click the cover at the top of a playlist, album, artist, or podcast page to
 see it enlarged, at the largest size Spotify has. Click anywhere or press
 `Esc` to return to the page.
+
+## Release dates
+
+Hover over the year at the top of an album, single or EP page to see its full release
+date, like "Oct 5, 2026". Spotify knows some releases only to the year, for 
+those, hovering will just show the year.
 
 ## Refreshing a playlist
 

@@ -364,6 +364,51 @@ fn local_files_detail(app: &App) -> String {
     }
 }
 
+/// Soloist supplies audio, while this separate Spotify approval supplies
+/// library features. Reuse the existing grant without changing players.
+pub(super) fn spotify_access_control(app: &mut App, ui: &mut egui::Ui) {
+    use crate::backend::LocalPlayback;
+    let locale = app.locale;
+    let palette = app.palette;
+    let (status, busy, action) = match &app.local_playback {
+        LocalPlayback::Ready { .. } => (gettext(locale, "Connected"), false, None),
+        LocalPlayback::Authorizing => (
+            gettext(locale, "Finish authorizing in your browser."),
+            true,
+            None,
+        ),
+        LocalPlayback::Connecting => (gettext(locale, "Connecting to Spotify…"), true, None),
+        LocalPlayback::WaitingForNetwork => (gettext(locale, "Waiting for network…"), true, None),
+        LocalPlayback::Unavailable => ("".into(), false, Some(gettext(locale, "Authorize"))),
+        LocalPlayback::Failed(_) => ("".into(), false, Some(gettext(locale, "Try again"))),
+    };
+    if let Some(action) = action {
+        let mut response = theme::pill_button(ui, &palette, &action, true);
+        if let LocalPlayback::Failed(error) = &app.local_playback {
+            response = response.on_hover_text(error);
+        }
+        if response.clicked() {
+            app.actions.push(Action::EnablePlayback);
+        }
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            if busy {
+                ui.add(egui::Spinner::new().size(14.0).color(palette.secondary));
+            }
+            let galley = crate::bidi::layout(
+                ui.painter(),
+                &status,
+                theme::regular(13.0),
+                palette.secondary,
+                ui.available_width(),
+                usize::MAX,
+                None,
+            );
+            ui.add(egui::Label::new(galley));
+        });
+    }
+}
+
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     let locale = app.locale;
@@ -400,6 +445,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .unwrap_or(false);
     let mut changed = false;
     let mut any_visible = false;
+    let soloist = gettext(locale, "Spotify Soloist");
+    if row_matches(
+        &needle,
+        &soloist,
+        &gettext(locale, "Playback lossless setup key download updates"),
+    ) {
+        any_visible = true;
+        section(ui, &palette, &soloist, |ui| super::soloist::show(app, ui));
+    }
+
     let open_folder = gettext(locale, "Open folder");
 
     let wanted = app
@@ -458,6 +513,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         )
         .when(!in_use && wanted.is_some()),
         RowText::new(sign_out.clone(), account.clone()),
+        RowText::new(
+            gettext(locale, "Spotify access"),
+            gettext(
+                locale,
+                "Made for you, listening activity and Spotify lyrics.",
+            ),
+        )
+        .when(app.settings.soloist_enabled),
     ];
     if section_matches(&needle, &account, &account_rows) {
         any_visible = true;
@@ -577,6 +640,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     }
                 });
             }
+            filtered_row(ui, &palette, &needle, &account, &account_rows[5], |ui| {
+                spotify_access_control(app, ui);
+            });
         });
     }
 
@@ -618,7 +684,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Some(gettext(locale, "Enable playback here")),
         ),
     };
-    let playback = gettext(locale, "Playback on this computer");
+    let built_in = !app.settings.soloist_enabled;
+    let audio_processing = app.audio_processing_available();
+    let visualizers = app.visualizers_available();
+    let playback = if built_in {
+        gettext(locale, "Playback on this computer")
+    } else {
+        gettext(locale, "Application")
+    };
     let normalize_volume = gettext(locale, "Normalize volume");
     let autoplay = gettext(locale, "Autoplay");
     let gapless = gettext(locale, "Gapless playback");
@@ -640,7 +713,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let start_available = app
         .autostart
         .is_some_and(|state| state != fastframe_autostart::State::Unsupported);
-    let playback_rows = [
+    let mut playback_rows = [
         RowText::new(
             // Translators: {status} is a playback state such as Ready or Not set up.
             gettext(locale, "Status: {status}").replace("{status}", &status),
@@ -731,6 +804,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .when(!cfg!(target_os = "macos")),
         RowText::new(start_with_computer.clone(), start_detail).when(start_available),
     ];
+    for index in [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 14] {
+        playback_rows[index].available &= built_in;
+    }
     if section_matches(&needle, &playback, &playback_rows) {
         any_visible = true;
         section(ui, &palette, &playback, |ui| {
@@ -1078,9 +1154,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 });
             });
             ui.add_space(4.0);
-            if playback_dirty
-                || playback_rows[10].matches(&needle, &playback)
-                || playback_rows[11].matches(&needle, &playback)
+            if built_in
+                && (playback_dirty
+                    || playback_rows[10].matches(&needle, &playback)
+                    || playback_rows[11].matches(&needle, &playback))
             {
                 ui.horizontal(|ui| {
                     if playback_dirty {
@@ -1134,7 +1211,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         let detail = theme::pair_detail(&app.custom_themes, locale, &app.settings.theme_pair, base);
         RowText::new(title, if detail.is_empty() { usage } else { detail }).when(show_pair)
     };
-    let appearance_rows = [
+    let mut appearance_rows = [
         RowText::new(theme_title.clone(), {
             let detail = theme::catalog_detail(
                 &app.custom_themes,
@@ -1225,6 +1302,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         pair_row(fastframe_theme::Base::Light),
         pair_row(fastframe_theme::Base::Dark),
     ];
+    for index in [8, 9, 10] {
+        appearance_rows[index].available &= visualizers;
+    }
     if section_matches(&needle, &appearance, &appearance_rows) {
         any_visible = true;
         section(ui, &palette, &appearance, |ui| {
@@ -1937,7 +2017,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .join(" "),
         ),
     ];
-    if section_matches(&needle, "MilkDrop", &milkdrop_rows) {
+    if visualizers && section_matches(&needle, "MilkDrop", &milkdrop_rows) {
         any_visible = true;
         section(ui, &palette, "MilkDrop", |ui| {
             filtered_row(ui, &palette, &needle, "MilkDrop", &milkdrop_rows[0], |ui| {
@@ -2070,7 +2150,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .join(" "),
         ),
     ];
-    if section_matches(&needle, &equalizer, &equalizer_rows) {
+    if audio_processing && section_matches(&needle, &equalizer, &equalizer_rows) {
         any_visible = true;
         section(ui, &palette, &equalizer, |ui| {
             filtered_row(
@@ -2165,7 +2245,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 "{folder}",
                 &app.dirs.audio_cache_dir().display().to_string(),
             ),
-        ),
+        )
+        .when(built_in),
         RowText::new(
             gettext(locale, "Play history"),
             gettext(

@@ -18,6 +18,20 @@ pub(super) const WINAMP_SHORTCUT: &str = platform_shortcut("Ctrl+M", "Cmd+Shift+
 pub(super) const MILKDROP_SHORTCUT: &str = platform_shortcut("Ctrl+Shift+K", "Cmd+Shift+K");
 
 pub fn handle(app: &mut App, ctx: &egui::Context) {
+    if app.show_soloist_onboarding() || app.soloist_waiting() {
+        // Setup owns navigation, but the window must still close and quit.
+        // Consume shifted variants first so Cmd+Shift+Q never becomes Quit.
+        ctx.input_mut(|input| {
+            for (key, action) in [(Key::Q, Action::Quit), (Key::W, Action::CloseWindow)] {
+                if !input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, key)
+                    && input.consume_key(Modifiers::COMMAND, key)
+                {
+                    app.actions.push(action);
+                }
+            }
+        });
+        return;
+    }
     // A focused song row still takes Ctrl+arrow and plain shortcuts to
     // control playback; a text field uses those keys for typing and moving
     // its caret.
@@ -767,6 +781,20 @@ mod tests {
             format!("{:?}", [Action::SetLyricsFullscreen(false)]),
             "F leaves lyrics full screen"
         );
+        if crate::soloist::install::supported() {
+            app.soloist_onboarding = crate::settings::SoloistOnboarding::Welcome;
+            assert_eq!(
+                press(&mut app, Key::Q, command),
+                format!("{:?}", [Action::Quit])
+            );
+            assert_eq!(
+                press(&mut app, Key::W, command),
+                format!("{:?}", [Action::CloseWindow])
+            );
+            assert_eq!(press(&mut app, Key::Q, shift), "[]");
+            assert_eq!(press(&mut app, Key::F, command), "[]");
+            assert_eq!(press(&mut app, Key::Space, Modifiers::NONE), "[]");
+        }
         app.backend.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }

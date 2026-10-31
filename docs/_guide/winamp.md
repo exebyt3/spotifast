@@ -81,6 +81,8 @@ drag the lower-right corner to resize the window. Use X or **PL** to close it.
   this computer is playing. Songs from the playing album or playlist stay.
 
 Notices from the main window scroll through the mini player's text display.
+The skin's capital-letter font folds accented Latin letters, including Turkish
+letters, to its available shapes. Other scripts use a fallback font.
 
 ## Equalizer
 

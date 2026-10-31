@@ -6,6 +6,12 @@ nav_order: 1
 
 ## Independent grants, once each
 
+After sign-in, the one-time player setup leads with [Spotify Soloist](/soloist/)
+on supported platforms. This also appears for existing built-in listeners
+after updating. Its personal key and pairing are separate from the grants
+below. Choosing the built-in player is remembered; existing librespot grants
+remain available for playback and library requests.
+
 Spotifast uses separate credentials for Web API access and local playback:
 
 1. **Your own Spotify app**, the personal app, carries the Web API: account,
@@ -75,6 +81,11 @@ Spotifast uses separate credentials for Web API access and local playback:
    are read once per run and kept in memory. Nothing from the panel is written
    to disk or logged. If the feed fails, the session's older
    `presence-view/v1/buddylist` stands in.
+
+When Soloist plays, **Settings → Account → Spotify access** keeps this separate
+connection available. **Authorize** opens the existing browser approval without
+switching playback to the built-in player. Once connected, missing Made for you,
+listening activity and lyrics can be read again through the session.
 
 Local playback authorization stays separate from the Web API grants. Its
 browser approval requests only the streaming permission and always shows the
@@ -769,3 +780,29 @@ session's own authorization. Spotify refuses the change if the playlist
 changed since. The request is sent once, never retried, and has a 20-second
 deadline. A row that is no longer
 in the playlist removes nothing; the playlist reloads and shows the error.
+
+## Optional Soloist player
+
+[Soloist setup](/soloist/) describes the optional Spotify-owned player.
+Spotifast downloads it directly from Spotify, stores its personal key in the
+system credential store, and starts one child with a loopback-only WebSocket.
+The device must appear in the signed-in account's Spotify device list before
+local control is enabled. Basic commands and state use the local API;
+collection starts keep their offset through the existing playback request.
+Library and metadata connections remain available through the existing Web
+API and librespot session. Signing out stops the child and deletes its saved
+key and pairing data. Soloist's own streaming traffic is not routed by
+Spotifast's proxy settings.
+
+On Linux with PipeWire, the managed child is given a private input through
+`--pipewire-device`. Native PipeWire streams apply the existing equalizer and
+feed the visualizers before volume, then play through the default output.
+Only that child's stream is held at unity gain; its documented volume events
+set the final processed gain. The route is temporary and local, and writes no
+audio to disk. The Mac native-audio route also reroutes the owned child.
+Once its private tap mutes direct output, the loopback API sets source volume
+to 100% and confirms that level from playback state or a volume event.
+Subsequent volume-change events from Spotify update Spotifast's output fader,
+then restore the source to 100%. Reset echoes and state snapshots never
+replace the output fader. Windows capture only observes the direct output,
+so this volume policy is not applied there.
