@@ -3445,7 +3445,14 @@ impl App {
             // row is the session's audio-key service gone bad, which
             // leaves librespot feeding the decoder encrypted bytes and
             // skipping through the whole album. A fresh session cures it.
-            if error.starts_with("This item isn't available") {
+            //
+            // A song that keeps playing means the refused ones were only
+            // queued ahead (region-locked tracks preloaded behind the
+            // current one): a reconnect there drops the context and the
+            // repeat setting, and the queue runs out into autoplay.
+            if error.starts_with("This item isn't available")
+                && state.playback != Playback::Playing
+            {
                 let now = Instant::now();
                 self.unavailable_at
                     .retain(|at| now.duration_since(*at) < Duration::from_secs(20));
