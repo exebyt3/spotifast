@@ -3480,10 +3480,14 @@ impl App {
         ) {
             log::info!("playback ended; playing what Spotify follows {seed} with");
             self.local_list = None;
+            // librespot's autoplay endpoint answers 400 now, and the load then
+            // falls back to the context's first song. The radio station of the
+            // last song is what the Radio page plays, and it resolves.
+            let station = crate::util::station_uri(&seed);
             self.backend.player(PlayerCommand::Load(LoadSpec {
-                context_uri: Some(seed),
+                autoplay: station.is_none(),
+                context_uri: Some(station.unwrap_or(seed)),
                 play: true,
-                autoplay: true,
                 ..LoadSpec::default()
             }));
         }
