@@ -101,7 +101,8 @@ clients. Spotifast uses its session for:
   Spotify's own clients, with the session's Login5 bearer and client token.
   It uses the configured HTTP transport and falls back to the Web API, which
   answers only a shared grant from before 0.14.2, if that read is unavailable. A different account's session is never used.
-- **Upcoming album pages.** Prerelease metadata supplies the real album mapping,
+- **Upcoming album pages.** Artist overviews supply countdown cards without a
+  prior pre-save. Prerelease metadata supplies the real album mapping,
   cover and release time. Pathfinder supplies ordered preview rows and explicit
   playability; unpublished rows stay visible without entering playback. The
   session collection service reads pre-save state and writes it only after the
@@ -138,6 +139,8 @@ clients. Spotifast uses its session for:
 - **Play counts** on album pages and an artist's popular songs, from the
   Pathfinder queries Spotify's own pages make. The Web API has none. When
   the read fails, the lists leave the counts out.
+- **Monthly listeners** on an artist page, from the same artist query. The
+  Web API has no such number.
 - **Listening activity**: what the people the account follows are playing,
   from the private feed behind Spotify's own panel. The Web API has no such
   request. Spotify may change this response without notice; when the feed
@@ -177,7 +180,8 @@ EQ and visualizers, and Windows visualizers. The Mac route applies Spotifast’s
 output volume after the visualizers and hold Soloist's source at 100% once
 redirected. Spotify/phone volume events change that output level before the
 source is reset, so Spotify's indicator returns to 100%. Windows capture
-follows source volume and cannot provide an audible EQ route.
+comes after source volume, which the visualizers undo, and cannot provide an
+audible EQ route.
 
 ## librespot playback
 

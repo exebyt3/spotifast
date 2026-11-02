@@ -387,18 +387,27 @@ const PLAY_COUNT_PAGE: usize = 50;
 /// No album runs longer; a page that never ends stops here.
 const MAX_PLAY_COUNT_ROWS: usize = 1000;
 
-/// Spotify's play count for each song of an album, or of an artist's
-/// popular songs, by track URI. Only the Pathfinder queries Spotify's own
-/// apps make carry them: the Web API has none. A song Spotify gives no
-/// count is left out, and the caller shows nothing for it.
-pub async fn play_counts(
+/// Supplementary album or artist data returned by Spotify's Pathfinder queries.
+#[derive(Debug, Default)]
+pub struct PageMetadata {
+    /// Songs' play counts by track URI, and an artist's monthly listeners
+    /// under the artist's own URI.
+    pub play_counts: HashMap<String, u64>,
+    pub upcoming: Option<crate::prerelease::UpcomingRelease>,
+}
+
+/// Read song play counts and, for artists, monthly listeners and the
+/// upcoming release. None of them is available through the Web API. Songs
+/// without counts are left out.
+pub async fn page_metadata(
     session: &Session,
     web: &crate::api::ApiClient,
     uri: &str,
-) -> anyhow::Result<HashMap<String, u64>> {
+) -> anyhow::Result<PageMetadata> {
     let login = session.login5().auth_token().await?;
     let client_token = session.spclient().client_token().await?;
     let mut counts = HashMap::new();
+    let mut upcoming = None;
     match crate::util::uri_kind(uri) {
         Some("album") => {
             let mut offset = 0;
@@ -432,7 +441,7 @@ pub async fn play_counts(
         Some("artist") => {
             let query = serde_json::json!({
                 "operationName": "queryArtistOverview",
-                "variables": {"uri": uri, "locale": "", "includePrerelease": false},
+                "variables": {"uri": uri, "locale": "", "includePrerelease": true},
                 "extensions": {
                     "persistedQuery": {"version": 1, "sha256Hash": ARTIST_OVERVIEW_HASH}
                 }
@@ -440,14 +449,39 @@ pub async fn play_counts(
             let body = web
                 .partner_request(&login.access_token, &client_token, &query)
                 .await?;
+            anyhow::ensure!(
+                body.get("errors").is_none_or(
+                    |errors| errors.is_null() || errors.as_array().is_some_and(Vec::is_empty)
+                ),
+                "Spotify could not return this artist overview"
+            );
+            upcoming = upcoming_release(
+                body.pointer("/data/artistUnion")
+                    .ok_or_else(|| anyhow::anyhow!("missing artist overview"))?,
+            );
             let top = body
                 .pointer("/data/artistUnion/discography/topTracks")
                 .ok_or_else(|| anyhow::anyhow!("Spotify answered without the popular songs"))?;
             play_counts_from(top, &mut counts);
+            if let Some(listeners) = monthly_listeners(&body) {
+                counts.insert(uri.to_string(), listeners);
+            }
         }
         _ => anyhow::bail!("Spotify counts plays only for album and artist songs"),
     }
-    Ok(counts)
+    Ok(PageMetadata {
+        play_counts: counts,
+        upcoming,
+    })
+}
+
+/// An artist's upcoming release. One this app cannot read is logged and left
+/// out: the play counts in the same answer still stand.
+fn upcoming_release(artist: &serde_json::Value) -> Option<crate::prerelease::UpcomingRelease> {
+    crate::prerelease::UpcomingRelease::from_artist(artist).unwrap_or_else(|error| {
+        log::warn!("leaving out an unreadable upcoming release: {error}");
+        None
+    })
 }
 
 /// Adds the counts of a Pathfinder list of `{track: {uri, playcount}}`
@@ -464,10 +498,7 @@ fn play_counts_from(list: &serde_json::Value, counts: &mut HashMap<String, u64>)
             continue;
         };
         let uri = track.get("uri").and_then(|uri| uri.as_str());
-        let count = track.get("playcount").and_then(|count| match count {
-            serde_json::Value::String(text) => text.parse::<u64>().ok(),
-            other => other.as_u64(),
-        });
+        let count = track.get("playcount").and_then(pathfinder_count);
         if let (Some(uri), Some(count)) = (uri, count)
             && uri.starts_with("spotify:track:")
         {
@@ -475,6 +506,20 @@ fn play_counts_from(list: &serde_json::Value, counts: &mut HashMap<String, u64>)
         }
     }
     rows.len()
+}
+
+/// An artist's monthly listeners in its `queryArtistOverview` answer.
+fn monthly_listeners(body: &serde_json::Value) -> Option<u64> {
+    body.pointer("/data/artistUnion/stats/monthlyListeners")
+        .and_then(pathfinder_count)
+}
+
+/// A Pathfinder count, a string of digits or a number.
+fn pathfinder_count(count: &serde_json::Value) -> Option<u64> {
+    match count {
+        serde_json::Value::String(text) => text.parse::<u64>().ok(),
+        other => other.as_u64(),
+    }
 }
 
 /// Whether this account has already pre-saved the album resolved from the countdown page.
@@ -2705,6 +2750,23 @@ mod tests {
             super::play_counts_from(&serde_json::json!({}), &mut counts),
             0
         );
+    }
+
+    #[test]
+    fn a_malformed_upcoming_release_is_left_out() {
+        let artist = serde_json::from_str(include_str!("testdata/artist-prerelease.json")).unwrap();
+        assert!(super::upcoming_release(&artist).is_some());
+        assert!(super::upcoming_release(&serde_json::json!({"preRelease": "odd"})).is_none());
+        assert!(super::upcoming_release(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn an_artist_overview_carries_its_monthly_listeners() {
+        let body = serde_json::json!({"data": {"artistUnion": {
+            "stats": {"followers": 52, "monthlyListeners": 8_123_456}
+        }}});
+        assert_eq!(super::monthly_listeners(&body), Some(8_123_456));
+        assert_eq!(super::monthly_listeners(&serde_json::json!({})), None);
     }
 
     /// A lost reply is uncertain, including when the server accepted the write.

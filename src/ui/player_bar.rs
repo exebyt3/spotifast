@@ -769,10 +769,14 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
 
     let disc = slot(widths[2]);
     if loading || app.any_play_pending() {
-        ui.painter()
-            .circle_filled(disc.center(), 18.0, palette.text);
         let mut cell = centered(ui, disc);
-        theme::spinner(&mut cell, 22.0, palette.window);
+        theme::circle_spinner(
+            &mut cell,
+            36.0,
+            palette.text,
+            palette.window,
+            &gettext(app.locale, "Loading…"),
+        );
     } else {
         let icon = if playing {
             Icon::PauseFilled
@@ -939,11 +943,8 @@ fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, transport_
         ) {
             SliderEvent::Dragging(value) => {
                 app.volume_preview = Some(value);
-                // Local volume is cheap to apply continuously; remote goes on release.
-                if now.is_none_or(|now| now.local) {
-                    app.actions
-                        .push(Action::PreviewVolume((value * 100.0).round() as u8));
-                }
+                app.actions
+                    .push(Action::PreviewVolume((value * 100.0).round() as u8));
             }
             SliderEvent::Committed(value) => {
                 app.volume_preview = None;

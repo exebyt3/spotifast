@@ -36,6 +36,12 @@ a lossless indicator or offer an unsupported quality selector.
    in your signed-in account's device list before controlling it. Choose
    **Start listening** once setup confirms the account.
 
+If the device never appears, try the Spotify desktop app first: some people find
+that the phone and web apps do not list it until it has been chosen once. A
+firewall can also hide it, because Spotify's apps find Soloist over the local
+network. On Linux with UFW, allow Soloist's TCP port (`sudo ss -tlnp | grep
+soloist` shows it) from your local network.
+
 You can choose **Use the built-in player** at any setup step, including after
 a failed download or while waiting for pairing. This stops Soloist if setup
 started it. The built-in player's separate browser approval is requested only
@@ -71,7 +77,8 @@ Spotifast. Version, quality and other background details remain in Settings;
 **Use the built-in player** stays available as a small link below each setup card.
 The saved key and pairing are retained for **Enable with saved key** next time; signing out of Spotifast
 removes them. Closing Spotifast completely stops the child player. Closing to
-the tray leaves both running.
+the tray leaves both running. If an earlier Spotifast left its player running,
+the next start stops that player first, so it cannot block the new one.
 
 Spotify publishes Linux x86_64, ARM64 and ARM32 builds, Apple Silicon builds
 for macOS 13 or newer, and Windows x86_64 builds. Intel Macs and native
@@ -106,7 +113,9 @@ yet expose those as Soloist preferences.
 
 Library browsing, search and playlist management keep using Spotifast's
 existing Spotify connections. Soloist's loopback API handles basic playback
-controls, state and queue reads. Starting a collection at a chosen row goes
+controls, state and queue reads. If its event connection drops while Soloist
+is still available, Spotifast reconnects it. A second drop within 30 seconds shows an error.
+Starting a collection at a chosen row goes
 through the existing Spotify playback request, retaining its context and
 position; it does not skip through earlier songs or shorten the playlist.
 
@@ -192,9 +201,12 @@ its private Mac route has taken over the audible output. If Soloist does not
 confirm the full source level within five seconds, the player stops and offers
 retry in Settings.
 
-Windows capture still follows Soloist's volume: **zero stops the visualizers**.
-The tested WASAPI session and stream controls affect capture too, so they
-cannot supply a separate output fader. Windows 11's
+Windows capture comes after Soloist's volume, so Spotifast undoes Soloist's
+volume curve for the visualizers: they keep their level as the volume falls.
+A muted source sends no signal, so **zero still stops the visualizers**.
+Lowering Soloist in the Windows volume mixer also shrinks them, because
+Soloist does not report that level. The tested WASAPI session and stream
+controls affect capture too, so they cannot supply a separate output fader. Windows 11's
 [pre-volume loopback option](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/ksproperty-audioloopback)
 refers to endpoint volume, which affects other apps as well. Spotifast leaves
 that system control alone.
@@ -204,6 +216,11 @@ player. Spotifast only offers controls exposed by the documented Soloist API;
 those names alone do not establish an integration.
 
 ## Credentials, privacy and terms
+
+What Soloist prints goes to `soloist-output.log` in its private folder for your
+account, with your key removed, and each start replaces the file. It is not
+part of `spotifast.log`. Read it before sharing it: it comes from Spotify's
+program, and Spotifast cannot say what else it contains.
 
 The key belongs to your Spotify account and is stored with Spotifast's other
 protected credentials. Soloist currently accepts it only as a command-line

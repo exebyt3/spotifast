@@ -132,6 +132,10 @@ another playlist moves them there.
 These keys edit the text instead while a search, filter or other text field
 has focus.
 
+To copy a song's title or artists instead of its link, right-click it and open
+**Copy details**. It offers the song title, the artists, or both as
+"Artist - Title".
+
 Clear any playlist filter or sort before placing songs between rows, so the
 visible positions match Spotify's order. A duplicate confirmation keeps the
 chosen position when you select **Add anyway**. Dragging near the top or bottom
@@ -188,6 +192,12 @@ while it plays from a playlist you can edit.
 Click the cover at the top of a playlist, album, artist, or podcast page to
 see it enlarged, at the largest size Spotify has. Click anywhere or press
 `Esc` to return to the page.
+
+## Links in playlist descriptions
+
+Links in a playlist's description stand out from the rest of it and can be
+clicked: a link to a Spotify playlist, artist or other page opens it here, and
+a web link opens in your browser.
 
 ## Release dates
 
@@ -272,9 +282,12 @@ this playlist**. On macOS, both `Delete` and `Fn+Delete` work. Text fields,
 dialogs and open menus keep Delete from acting on the list.
 
 Press and hold the player bar's volume slider to update local volume without
-moving the pointer. Remote volume is sent on release and keeps your chosen
+moving the pointer. Spotifast's own Soloist follows a drag as you go; other
+remote volume is sent on release. Both keep your chosen
 level while Spotify updates, including during rate limits. Fresh updates
-can confirm the level or show a change made on another device. If the volume
+can confirm the level or show a change made on another device. Some speakers,
+Sonos among them, report the old level for a few seconds after a change, so
+for six seconds the slider keeps your level over such a report. If the volume
 request fails, an error appears and the slider returns to the reported level.
 The seek slider previews on press and seeks on release.
 
@@ -410,9 +423,11 @@ Gear Lever work as well, from the update information inside it.
 
 Select **By You** under Playlists to show only playlists owned by your signed-in
 account, alongside Liked Songs. Followed playlists and collaborative playlists
-owned by someone else are hidden, including pinned ones. Search and the selected
-sort still apply. Matching playlists appear in a flat list, including those in
-collapsed folders. Turn By You off to restore the full list and folder view.
+owned by someone else are hidden, including pinned ones. The selected sort still
+applies. In text search and sorts that do not support folders, the playlists are shown 
+in a flat list. In sorts that do support folders, folders stay in place with only your
+playlists inside: folders left empty are hidden, counts show your playlists,
+and collapsed folders stay collapsed. Turn By You off to restore the full list.
 The choice is remembered on this computer and only affects the Playlists shelf.
 It uses the ownership information already loaded with your library and makes no
 additional Spotify requests.
@@ -426,7 +441,7 @@ dates come last.
 
 **Name** keeps your Spotify playlist folders, as Spotify does: playlists sort
 by name inside each folder, and folders sort by name among the playlists
-beside them. A search or **By You** still lists matching playlists flat.
+beside them. A search still lists matching playlists flat.
 
 **Spotify custom order** follows your playlist order and folders from Spotify.
 Set up playback on this computer to load that order. Your playlists stay
@@ -531,7 +546,7 @@ keys and the system's now-playing controls continue working while the window
 is closed.
 
 For the Winamp mini player, turn off **Show in taskbar** under
-**Settings > Winamp skins**, or **Show in taskbar** in its options menu.
+**Settings > Mini player**, or **Show in taskbar** in its options menu.
 The choice survives restarts. The mini player stays visible; the tray icon,
 **Ctrl+M**, the skin logo, and launching Spotifast again remain ways to reach
 the app. Returning to the main window always restores its taskbar button.
@@ -741,9 +756,25 @@ Album pages have a **Plays** column, and an artist's popular songs show
 how often each was played, as Spotify counts them. The counts come from
 Spotify's playback service, so they need playback on this computer to be
 set up. Without it, or when Spotify does not answer, the lists leave the
-counts out. The column needs a window wide enough for it.
+counts out. The column needs a window wide enough for it. Click the
+**Plays** heading to sort the album's songs from most to least played, again
+for least to most, and a third time to return to album order. Songs without a
+count sort last.
+
+The same answer gives an artist's monthly listeners, which the top of the
+artist page then shows first.
 
 ## Upcoming albums
+
+Artist pages show a **Release countdown** section between Popular and Discography
+when Spotify supplies a countdown page. Select its album row to open the artwork,
+countdown, track preview and Pre-save button. The preview shows play counts when
+Spotify supplies them and the window has room for the extra column.
+Discovery needs both a ready same-account Spotify access (local playback)
+connection and a verified Web API sign-in, including when Soloist handles
+playback. Until both are ready, a fresh artist visit may show no countdown card.
+Visiting the artist never pre-saves an album. Refresh the artist
+page to check for a newly announced release; cards disappear after release time.
 
 Open a `spotify:prerelease:` URI or an `open.spotify.com/prerelease/` link
 with Spotifast to see the artwork, release countdown and track-list preview.

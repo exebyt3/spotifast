@@ -88,8 +88,15 @@ const ASSUMED_CONTEXT_HOLD: Duration = Duration::from_secs(8);
 const PLAYBACK_HOLD: Duration = Duration::from_secs(6);
 /// Delay before checking playback again after a command.
 const REMOTE_RECHECK: Duration = Duration::from_millis(1200);
+/// Least time between polls that Spotify's pushes ask for. Turning another
+/// device's volume knob pushes several changes a second; this answers the
+/// first at once and folds the rest into one poll a second later.
+const REMOTE_PUSH_SPACING: Duration = Duration::from_secs(1);
 /// Delay before checking the queue after a local change.
 const QUEUE_RECHECK: Duration = Duration::from_millis(700);
+/// Delay before reading a playlist's metadata again while Spotify still
+/// reports the snapshot from before a write.
+const PLAYLIST_SNAPSHOT_RECHECK: Duration = Duration::from_secs(1);
 /// Number of stale queue responses accepted before trusting Spotify's state.
 const QUEUE_STALE_RETRIES: u8 = 6;
 /// Duplicate queue requests within this window count as one click.
@@ -112,7 +119,18 @@ struct PendingRemoteVolume {
     /// Polls already sent when the write completed still describe the past.
     /// None while the write is waiting for Spotify.
     after_poll: Option<u64>,
+    /// When Spotify accepted the write.
+    written_at: Option<Instant>,
     mismatches: u8,
+}
+
+/// A volume Spotify pushed for the remote device.
+struct PushedVolume {
+    percent: u8,
+    device_id: String,
+    /// The last poll sent before the push. Its response, or an older one,
+    /// may still carry the volume from before.
+    poll_seq: u64,
 }
 
 /// A context shown as playing before Spotify confirms it.
@@ -299,6 +317,10 @@ struct Listening {
 pub enum PlayCountRead {
     Asked,
     Answered,
+    /// An artist's valid overview with no counts at all; it may still have a
+    /// prerelease, and is revalidated with it. An album with no counts, or an
+    /// artist with listeners but no songs' counts, counts as `Failed`.
+    Empty,
     /// The read failed then; it is asked again after `PLAY_COUNT_RETRY`.
     Failed(Instant),
 }
@@ -306,8 +328,19 @@ pub enum PlayCountRead {
 /// How long a failed play count read waits before a visit asks again.
 const PLAY_COUNT_RETRY: Duration = Duration::from_secs(60);
 
+/// Successful artist overviews are revalidated while viewed, at most every ten minutes.
+const ARTIST_METADATA_REFRESH: Duration = Duration::from_secs(10 * 60);
+
+/// Last successful artist overview, retained while a refresh is pending or fails.
+struct ArtistMetadataRead {
+    received_at: Instant,
+    has_counts: bool,
+}
+
 pub struct App {
     pub dirs: AppDirs,
+    pub(crate) storage_usage: crate::storage::Usage,
+    pub(crate) clearing_audio_cache: bool,
     pub settings: Settings,
     /// Proxy policy actually handed to network workers. Manual form edits are
     /// drafts until Apply (or Sign in), so unrelated downloads and engine
@@ -518,6 +551,8 @@ pub struct App {
     load_generation: u64,
     pub album_pages: HashMap<String, AlbumPage>,
     pub artist_pages: HashMap<String, ArtistPage>,
+    /// Never reset on page eviction or account reset, so old replies cannot match.
+    artist_top_tracks_generation: u64,
     pub show_pages: HashMap<String, ShowPage>,
     /// Radio pages by the seed's URI.
     pub radio_pages: HashMap<String, RadioPage>,
@@ -626,6 +661,9 @@ pub struct App {
     pending_transfer_to: Option<(String, Instant)>,
     /// When to take a confirming look at remote playback after a command.
     remote_recheck_at: Option<Instant>,
+    /// When Spotify pushed a change to another device that no poll since
+    /// has asked about.
+    remote_pushed_at: Option<Instant>,
     pub seek_preview: Option<f32>,
     pub volume_preview: Option<f32>,
     /// The main window's size, position and maximized state: from the
@@ -655,7 +693,12 @@ pub struct App {
     pub shared_grant: bool,
     pending_remote_position: Option<(u32, Instant)>,
     pending_remote_volume: Option<PendingRemoteVolume>,
+    soloist_volume_preview: Option<Instant>,
     remote_volume_request: u64,
+    /// A volume Spotify pushed for the remote device. A poll already on
+    /// its way may still carry the one before, so its response keeps the
+    /// pushed one.
+    pushed_remote_volume: Option<PushedVolume>,
     /// A local volume set here that the engine has not echoed back yet. It
     /// reports `VolumeChanged` asynchronously while position snapshots land
     /// every second, so a snapshot must not undo the change on its way past.
@@ -725,10 +768,15 @@ pub struct App {
     pub user_names: HashMap<String, Option<String>>,
     pub user_names_revision: u64,
     /// How often Spotify says each song was played, by track URI, for the
-    /// albums and artists in `play_count_reads`.
+    /// albums and artists in `play_count_reads`, and each of those artists'
+    /// monthly listeners by artist URI.
     pub play_counts: HashMap<String, u64>,
     /// Albums and artists whose play counts were asked for, by URI.
     pub play_count_reads: HashMap<String, PlayCountRead>,
+    artist_metadata_reads: HashMap<String, ArtistMetadataRead>,
+    /// Upcoming releases read with artist play counts, kept only for this account.
+    pub artist_prereleases: HashMap<String, crate::prerelease::UpcomingRelease>,
+    play_count_generation: u64,
     /// User ids resolved to avatar picture urls, asked for alongside the
     /// names; `None` while unknown or when Spotify gives no picture.
     pub user_images: HashMap<String, Option<String>>,
@@ -897,6 +945,15 @@ impl fastframe_shell::Resident for App {
 /// the session's autostart apps.
 const TRAY_WAIT: Duration = Duration::from_secs(30);
 
+/// Whether a main window eframe restores full screen, with no fullscreen
+/// lyrics to explain it, opens as an ordinary window. Demo shots open full
+/// screen on purpose.
+const STARTS_WINDOWED: bool =
+    cfg!(windows) || (cfg!(target_os = "linux") && !cfg!(feature = "demo"));
+
+/// How often a volume drag updates our own Soloist.
+const SOLOIST_VOLUME_PACE: Duration = Duration::from_millis(100);
+
 /// The tray menu's Play or Pause entry, for what is playing.
 fn play_pause_label(playing: bool) -> &'static str {
     if playing { "Pause" } else { "Play" }
@@ -1060,6 +1117,8 @@ impl App {
         let palette = settings.fixed_palette().unwrap_or_else(Palette::dark);
         let mut app = Self {
             custom_themes: theme::Catalog::default(),
+            storage_usage: crate::storage::Usage::default(),
+            clearing_audio_cache: false,
             dirs,
             settings,
             applied_proxy,
@@ -1185,6 +1244,7 @@ impl App {
             load_generation: 0,
             album_pages: HashMap::new(),
             artist_pages: HashMap::new(),
+            artist_top_tracks_generation: 0,
             show_pages: HashMap::new(),
             radio_pages: HashMap::new(),
             hidden_songs: HashMap::new(),
@@ -1245,6 +1305,7 @@ impl App {
             local_list: None,
             pending_transfer_to: None,
             remote_recheck_at: None,
+            remote_pushed_at: None,
             seek_preview: None,
             volume_preview: None,
             window_geometry: fastframe_shell::window::Geometry {
@@ -1264,7 +1325,9 @@ impl App {
             shared_grant: false,
             pending_remote_position: None,
             pending_remote_volume: None,
+            soloist_volume_preview: None,
             remote_volume_request: 0,
+            pushed_remote_volume: None,
             pending_local_volume: None,
             pending_local_position: None,
             optimistic_playing: None,
@@ -1299,6 +1362,9 @@ impl App {
             user_names: HashMap::new(),
             play_counts: HashMap::new(),
             play_count_reads: HashMap::new(),
+            artist_prereleases: HashMap::new(),
+            artist_metadata_reads: HashMap::new(),
+            play_count_generation: 0,
             user_names_revision: 0,
             user_images: HashMap::new(),
             recent_contexts: session.recent_contexts.clone(),
@@ -1397,9 +1463,11 @@ impl App {
         }
         // eframe restores the full screen fullscreen lyrics left behind when
         // the app closed in them, without the lyrics. The mode they came
-        // from is known, or on Windows, where only fullscreen lyrics make
-        // the frameless main window full screen and nothing else could
-        // leave it, it was an ordinary window.
+        // from is known. Otherwise, away from macOS's full-screen button, it
+        // was an ordinary window: on Windows only fullscreen lyrics make the
+        // frameless window full screen, and on Linux a compositor's would
+        // come back with no title bar and nothing in the app to leave it
+        // (#1127).
         let lyrics_left = self.session_lyrics_fullscreen_from.take();
         if self.settings.winamp_window {
             // The mini player sizes itself; the big window's geometry
@@ -1417,7 +1485,7 @@ impl App {
         }
         let restored_full_screen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
         let lyrics_left = lyrics_left.or_else(|| {
-            (cfg!(windows) && restored_full_screen).then(crate::settings::WindowMode::default)
+            (STARTS_WINDOWED && restored_full_screen).then(crate::settings::WindowMode::default)
         });
         if let Some(mode) = lyrics_left
             && restored_full_screen
@@ -2016,11 +2084,34 @@ impl App {
         if let Some(track) = now.id.as_deref().and_then(|id| self.track_cache.get(id)) {
             return Some(PlayableItem::Track(track.clone()));
         }
+        // The album and art go along, so a playlist row added from the
+        // player bar shows them before Spotify returns the song.
+        let images = [(&now.art_small, 64), (&now.art_url, 640)]
+            .into_iter()
+            .filter_map(|(url, width)| {
+                Some(crate::api::models::Image {
+                    url: url.clone()?,
+                    width: Some(width),
+                    height: Some(width),
+                })
+            })
+            .collect();
         Some(PlayableItem::Track(Track {
             id: now.id.clone(),
             uri: now.uri.clone(),
             name: now.title.clone(),
             artists: now.artists.clone(),
+            album: Some(Album {
+                uri: now
+                    .album_id
+                    .as_ref()
+                    .map(|id| format!("spotify:album:{id}"))
+                    .unwrap_or_default(),
+                id: now.album_id.clone().unwrap_or_default(),
+                name: now.album_name.clone(),
+                images,
+                ..Album::default()
+            }),
             duration_ms: now.duration_ms,
             ..Track::default()
         }))
@@ -2566,10 +2657,10 @@ impl App {
 
     fn handle_backend_events(&mut self, events: Vec<Event>) {
         for event in events {
-            // Offline, as in demo mode, only colours read from cover art and
-            // local update checks come through.
+            // Offline, as in demo mode, disk-only audio clearing, colours
+            // read from cover art and local update checks still come through.
             if self.offline
-                && !matches!(&event, Event::Accent { .. })
+                && !matches!(&event, Event::Accent { .. } | Event::AudioCacheCleared(_))
                 && (self.update_source.is_github()
                     || !matches!(
                         &event,
@@ -2583,6 +2674,54 @@ impl App {
                 continue;
             }
             match event {
+                Event::AudioCacheCleared(result) => {
+                    self.clearing_audio_cache = false;
+                    self.storage_usage.invalidate();
+                    match result {
+                        Ok(cleared) => {
+                            self.toast(
+                                // Translators: {size} includes its unit, such as 12.5 MB.
+                                gettext(self.locale, "Cleared {size} of audio").replace(
+                                    "{size}",
+                                    &crate::storage::format_bytes(cleared.bytes),
+                                ),
+                            );
+                            if cleared.skipped > 0 {
+                                self.toast(
+                                    ngettext(
+                                        self.locale,
+                                        // Translators: Files in the audio cache that Spotifast did not put there, such as .DS_Store. They were not deleted.
+                                        "{count} unrecognized file was left in place.",
+                                        "{count} unrecognized files were left in place.",
+                                        cleared.skipped as u32,
+                                    )
+                                    .replace("{count}", &cleared.skipped.to_string()),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            use crate::storage::ClearAudioError;
+                            let error = match error {
+                                ClearAudioError::Reconnecting => gettext(
+                                    self.locale,
+                                    "Playback is reconnecting. Try again once it is ready.",
+                                )
+                                .into_owned(),
+                                ClearAudioError::FolderIsLink => gettext(
+                                    self.locale,
+                                    "The audio cache folder is a symbolic link.",
+                                )
+                                .into_owned(),
+                                ClearAudioError::Failed(error) => error,
+                            };
+                            self.toast_error(
+                                // Translators: {error} describes a filesystem or playback error.
+                                gettext(self.locale, "Couldn't clear audio cache: {error}")
+                                    .replace("{error}", &error),
+                            );
+                        }
+                    }
+                }
                 Event::PlaylistCoverChecked {
                     id,
                     request,
@@ -2652,6 +2791,12 @@ impl App {
                     }
                 }
                 Event::Local(state) => self.handle_local(*state),
+                Event::RemoteChanged => {
+                    self.remote_pushed_at.get_or_insert_with(Instant::now);
+                }
+                Event::RemoteVolume { device_id, volume } => {
+                    self.handle_remote_volume(&device_id, volume);
+                }
                 Event::Api(response) => self.handle_api(*response),
                 Event::Accent {
                     url,
@@ -2760,7 +2905,11 @@ impl App {
                     self.set_user_name(id.clone(), name);
                     self.set_user_image(id, image);
                 }
-                Event::PlayCounts { uri, result } => self.receive_play_counts(uri, result),
+                Event::PlayCounts {
+                    uri,
+                    generation,
+                    result,
+                } => self.receive_play_counts(uri, generation, result),
                 Event::AudiobookShows(uris) => {
                     self.audiobook_shows.extend(uris);
                 }
@@ -3023,6 +3172,18 @@ impl App {
                 }
                 if became_ready {
                     self.reread_playlists_over_session();
+                    let artists: Vec<_> = self
+                        .artist_pages
+                        .iter()
+                        .filter(|(_, page)| {
+                            page.top_tracks_without_session
+                                && matches!(page.top_tracks, Loadable::Failed(_))
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    for id in artists {
+                        self.request_artist_top_tracks(&id);
+                    }
                     // The session reads Spotify's own feed of new releases,
                     // which the Web API stand-in only approximates.
                     if self.home.requested {
@@ -3299,6 +3460,11 @@ impl App {
         self.hidden_songs_requested = false;
         self.prerelease_request = None;
         self.artist_pages.clear();
+        self.artist_prereleases.clear();
+        self.artist_metadata_reads.clear();
+        self.play_counts.clear();
+        self.play_count_reads.clear();
+        self.play_count_generation = self.play_count_generation.wrapping_add(1);
         self.show_pages.clear();
         self.album_types_requested.clear();
         self.audiobook_shows.clear();
@@ -4102,6 +4268,20 @@ impl App {
                 self.remote_recheck_at = None;
                 self.poll_remote(true);
             }
+            if self
+                .remote_push_due()
+                .is_some_and(|due| Instant::now() >= due)
+            {
+                // A change Spotify pushed after a command's recheck was
+                // planned makes this read the confirming look.
+                if let (Some(recheck), Some(pushed)) =
+                    (self.remote_recheck_at, self.remote_pushed_at)
+                    && pushed + REMOTE_RECHECK >= recheck
+                {
+                    self.remote_recheck_at = None;
+                }
+                self.poll_remote(true);
+            }
             if (self.show_devices
                 || (matches!(self.soloist_status, crate::soloist::Status::Ready { .. })
                     && self.soloist_device_id.is_none()))
@@ -4148,6 +4328,20 @@ impl App {
                     ctx.request_repaint_after(
                         (due - Instant::now()).max(Duration::from_millis(50)),
                     );
+                }
+            }
+            for (id, page) in &mut self.playlist_pages {
+                let Some(due) = page.snapshot_recheck_at else {
+                    continue;
+                };
+                if Instant::now() >= due {
+                    page.snapshot_recheck_at = None;
+                    self.backend.api(ApiRequest::Playlist {
+                        id: id.clone(),
+                        generation: page.generation,
+                    });
+                } else {
+                    ctx.request_repaint_after(due - Instant::now());
                 }
             }
         }
@@ -4197,7 +4391,12 @@ impl App {
             }
         }
         if let Some(loaded) = self.winamp.poll() {
-            self.skin_loaded(loaded);
+            self.skin_loaded(loaded, ctx);
+        }
+        self.winamp.poll_choices();
+        // Random needs the list before the mini player is first opened.
+        if self.settings.random_skin && !self.winamp.choices_known() {
+            self.winamp.refresh_choices(&self.dirs.skins_dir(), ctx);
         }
         let fetched = self.winamp.presets.poll();
         if let Some(fetched) = fetched {
@@ -4364,7 +4563,7 @@ impl App {
     }
 
     /// Applies a loaded skin. Installed files become the selected skin.
-    fn skin_loaded(&mut self, loaded: crate::winamp::Loaded) {
+    fn skin_loaded(&mut self, loaded: crate::winamp::Loaded, ctx: &egui::Context) {
         match loaded.result {
             Ok(skin) => {
                 self.winamp
@@ -4375,7 +4574,7 @@ impl App {
                         gettext(self.locale, "Added {skin} skin")
                             .replace("{skin}", crate::winamp::label(&loaded.name)),
                     );
-                    self.winamp.list_choices(&self.dirs.skins_dir());
+                    self.winamp.list_choices(&self.dirs.skins_dir(), ctx);
                     self.settings.skin = Some(loaded.name);
                     self.settings_dirty = true;
                 }
@@ -5529,6 +5728,21 @@ impl App {
         }
     }
 
+    fn request_artist_top_tracks(&mut self, id: &str) {
+        let Some(page) = self.artist_pages.get_mut(id) else {
+            return;
+        };
+        self.artist_top_tracks_generation = self.artist_top_tracks_generation.wrapping_add(1);
+        let generation = self.artist_top_tracks_generation;
+        page.top_tracks_generation = generation;
+        page.top_tracks = Loadable::Loading;
+        page.top_tracks_without_session = !self.local_ready;
+        self.backend.api(ApiRequest::ArtistTopTracks {
+            id: id.to_owned(),
+            generation,
+        });
+    }
+
     fn load_artist_albums(&mut self, id: &str, filter: DiscographyFilter) {
         let Some(page) = self.artist_pages.get_mut(id) else {
             return;
@@ -5953,6 +6167,7 @@ impl App {
                 }
             }
             Page::Playlist(id) => {
+                self.report_lagging_snapshot(&id);
                 if self.playlist_pages.get(&id).is_some_and(|page| {
                     page.pending_writes > 0
                         || page.optimistic_snapshot.is_some()
@@ -6033,9 +6248,30 @@ impl App {
         }
     }
 
+    /// Scrolling for rows that can't be read until Spotify's snapshot catches
+    /// up, after the rechecks gave up, says so rather than just stopping.
+    fn report_lagging_snapshot(&mut self, id: &str) {
+        let locale = self.locale;
+        if let Some(page) = self.playlist_pages.get_mut(id)
+            && page.optimistic_snapshot.is_some()
+            && page.pending_writes == 0
+            && page.snapshot_rechecks > 3
+            && page.items.error.is_none()
+        {
+            page.items.fail(
+                gettext(
+                    locale,
+                    "Spotify hasn't confirmed your playlist changes yet. Try refreshing again.",
+                )
+                .into_owned(),
+            );
+        }
+    }
+
     fn load_window(&mut self, page: Page, position: u32) {
         match page {
             Page::Playlist(id) => {
+                self.report_lagging_snapshot(&id);
                 let Some(page) = self.playlist_pages.get_mut(&id) else {
                     return;
                 };
@@ -6124,6 +6360,7 @@ impl App {
             page.local_additions.clear();
             page.optimistic_snapshot = None;
             page.snapshot_rechecks = 0;
+            page.snapshot_recheck_at = None;
             page.refresh_after_write = false;
             page.generation
         };
@@ -6161,6 +6398,7 @@ impl App {
                         // metadata confirmation before asking for rows.
                         playlist.refresh_after_write = true;
                         playlist.snapshot_rechecks = 0;
+                        playlist.snapshot_recheck_at = None;
                         if playlist.pending_writes == 0 {
                             self.backend.api(ApiRequest::Playlist {
                                 id: id.clone(),
@@ -6180,6 +6418,7 @@ impl App {
                     playlist.local_additions.clear();
                     playlist.optimistic_snapshot = None;
                     playlist.snapshot_rechecks = 0;
+                    playlist.snapshot_recheck_at = None;
                     self.backend.api(ApiRequest::Playlist {
                         id: id.clone(),
                         generation: playlist.generation,
@@ -6197,6 +6436,10 @@ impl App {
             }
             Page::Artist(id) => {
                 self.artist_pages.remove(id);
+                let uri = format!("spotify:artist:{id}");
+                if self.play_count_reads.get(&uri) != Some(&PlayCountRead::Asked) {
+                    self.play_count_reads.remove(&uri);
+                }
             }
             Page::Show(id) => {
                 // Refresh keeps the podcast and its episodes on screen; the
@@ -6230,6 +6473,9 @@ impl App {
         if !self.is_connected() {
             return;
         }
+        // This read covers every push received before it starts. A push
+        // arriving while it is pending remains for a follow-up.
+        self.remote_pushed_at = None;
         self.remote_poll_pending = true;
         self.remote_polled_at = Instant::now();
         self.remote_poll_seq += 1;
@@ -6799,9 +7045,10 @@ impl App {
         self.backend.send(Command::UserNames(unknown));
     }
 
-    /// Asks once for the play counts of the album or artist `uri`, while
+    /// Asks for the play counts of the album or artist `uri`, while
     /// the playback session can read them. A read that failed is asked
-    /// again on a visit a minute later.
+    /// again on a visit a minute later. Successful artist overviews are
+    /// revalidated after ten minutes to discover newly announced countdowns.
     pub fn request_play_counts(&mut self, uri: &str) {
         if !self.local_ready || !self.network_reachable {
             return;
@@ -6809,12 +7056,19 @@ impl App {
         let due = match self.play_count_reads.get(uri) {
             None => true,
             Some(PlayCountRead::Failed(at)) => at.elapsed() >= PLAY_COUNT_RETRY,
-            Some(PlayCountRead::Asked | PlayCountRead::Answered) => false,
+            Some(PlayCountRead::Answered | PlayCountRead::Empty) => self
+                .artist_metadata_reads
+                .get(uri)
+                .is_some_and(|read| read.received_at.elapsed() >= ARTIST_METADATA_REFRESH),
+            Some(PlayCountRead::Asked) => false,
         };
         if due {
             self.play_count_reads
                 .insert(uri.to_string(), PlayCountRead::Asked);
-            self.backend.send(Command::PlayCounts(uri.to_string()));
+            self.backend.send(Command::PlayCounts {
+                uri: uri.to_string(),
+                generation: self.play_count_generation,
+            });
         }
     }
 
@@ -6822,16 +7076,61 @@ impl App {
     /// so its list shows them.
     pub fn has_play_counts(&self, uri: &str) -> bool {
         self.play_count_reads.get(uri) == Some(&PlayCountRead::Answered)
+            || self
+                .artist_metadata_reads
+                .get(uri)
+                .is_some_and(|read| read.has_counts)
     }
 
-    fn receive_play_counts(&mut self, uri: String, result: Result<HashMap<String, u64>, String>) {
-        let read = match result {
-            // An answer without a single count has nothing to show.
-            Ok(counts) if !counts.is_empty() => {
-                self.play_counts.extend(counts);
-                PlayCountRead::Answered
+    fn receive_play_counts(
+        &mut self,
+        uri: String,
+        generation: u64,
+        result: Result<crate::session_reads::PageMetadata, String>,
+    ) {
+        if generation != self.play_count_generation {
+            return;
+        }
+        let artist = uri.starts_with("spotify:artist:");
+        // Monthly listeners share the map, under the artist's URI, but only a
+        // song's count gives the plays column anything to show.
+        let songs = result.as_ref().is_ok_and(|data| {
+            data.play_counts
+                .keys()
+                .any(|uri| uri.starts_with("spotify:track:"))
+        });
+        if let Ok(data) = &result
+            && artist
+        {
+            self.artist_metadata_reads.insert(
+                uri.clone(),
+                ArtistMetadataRead {
+                    received_at: Instant::now(),
+                    has_counts: songs,
+                },
+            );
+            if let Some(upcoming) = &data.upcoming {
+                self.artist_prereleases
+                    .insert(uri.clone(), upcoming.clone());
+            } else {
+                self.artist_prereleases.remove(&uri);
             }
-            Ok(_) | Err(_) => PlayCountRead::Failed(Instant::now()),
+        }
+        let read = match result {
+            Ok(data) => {
+                let nothing = data.play_counts.is_empty();
+                self.play_counts.extend(data.play_counts);
+                if songs {
+                    PlayCountRead::Answered
+                } else if artist && nothing {
+                    PlayCountRead::Empty
+                } else {
+                    // Songs' counts are missing, even if an artist's monthly
+                    // listeners came: asked again on a visit a minute later.
+                    PlayCountRead::Failed(Instant::now())
+                }
+            }
+            Err(_) => PlayCountRead::Failed(Instant::now()),
         };
         self.play_count_reads.insert(uri, read);
     }
@@ -7003,6 +7302,26 @@ impl App {
         }
     }
 
+    /// An endpoint denial is not an empty recommendation response. Keep any
+    /// recommendations already shown; without a usable result, omit the shelf.
+    /// Do not remember a permanent capability verdict: Home refresh tries again.
+    pub(crate) fn receive_recommendations(
+        &mut self,
+        result: Result<Vec<Track>, crate::api::ApiError>,
+    ) {
+        if result
+            .as_ref()
+            .is_err_and(|error| matches!(error.status(), Some(403 | 404)))
+            && self.home.recommendations.get().is_none_or(Vec::is_empty)
+        {
+            self.home.recommendations = Loadable::Loaded(Vec::new());
+        } else if self.home.recommendations.get().is_some_and(Vec::is_empty) {
+            self.home.recommendations = Loadable::from_result(result);
+        } else {
+            self.home.recommendations.refresh(result);
+        }
+    }
+
     /// Applies an API response to the current page and ignores stale Home data.
     fn handle_api(&mut self, mut response: ApiResponse) {
         match &mut response {
@@ -7164,7 +7483,25 @@ impl App {
                 }
                 self.remote_poll_pending = false;
                 match result {
-                    Ok(state) => {
+                    Ok(mut state) => {
+                        if let Some(pushed) = &self.pushed_remote_volume
+                            && state
+                                .as_ref()
+                                .and_then(|state| state.device.as_ref())
+                                .and_then(|device| device.id.as_deref())
+                                .is_some_and(|id| id != pushed.device_id)
+                        {
+                            self.pushed_remote_volume = None;
+                        }
+                        // A poll sent before the push read the volume from
+                        // before it, and a volume-only push asks for no poll.
+                        if let Some(pushed) = &self.pushed_remote_volume
+                            && seq <= pushed.poll_seq
+                            && let Some(device) =
+                                state.as_mut().and_then(|state| state.device.as_mut())
+                        {
+                            device.volume_percent = Some(pushed.percent);
+                        }
                         self.reconcile_remote_volume(seq, state.as_ref());
                         let previous_uri = self.remote.as_ref().and_then(|remote| {
                             remote
@@ -7457,7 +7794,7 @@ impl App {
                     let uris: Vec<String> = tracks.iter().map(|track| track.uri.clone()).collect();
                     self.request_contains(uris);
                 }
-                self.home.recommendations.refresh(result);
+                self.receive_recommendations(result);
             }
             ApiResponse::MadeForYou {
                 generation,
@@ -7648,6 +7985,7 @@ impl App {
                     if reported == Some(expected) {
                         page.optimistic_snapshot = None;
                         page.snapshot_rechecks = 0;
+                        page.snapshot_recheck_at = None;
                         false
                     } else if result.is_ok() {
                         page.snapshot_rechecks = page.snapshot_rechecks.saturating_add(1);
@@ -7659,16 +7997,13 @@ impl App {
                 if stale_write_snapshot {
                     let page = self.playlist_pages.get_mut(&id).unwrap();
                     if page.snapshot_rechecks <= 3 {
-                        self.backend.api(ApiRequest::Playlist { id, generation });
+                        // Spotify's metadata lags a write by a moment: ask
+                        // again shortly rather than at once.
+                        page.snapshot_recheck_at = Some(Instant::now() + PLAYLIST_SNAPSHOT_RECHECK);
                     } else {
+                        // Still lagging: keep the rows the write shows.
                         page.refresh_after_write = false;
-                        page.items.fail(
-                            gettext(
-                                self.locale,
-                                "Spotify hasn't confirmed your playlist changes yet. Try refreshing again.",
-                            )
-                            .into_owned(),
-                        );
+                        page.items.loading = false;
                     }
                     return;
                 }
@@ -8023,6 +8358,7 @@ impl App {
                             if snapshot.is_some() {
                                 page.optimistic_snapshot = snapshot.clone();
                                 page.snapshot_rechecks = 0;
+                                page.snapshot_recheck_at = None;
                             }
                             generation = Some(page.generation);
                         }
@@ -8048,6 +8384,7 @@ impl App {
                         if let Some(page) = self.playlist_pages.get_mut(&id) {
                             page.optimistic_snapshot = None;
                             page.snapshot_rechecks = 0;
+                            page.snapshot_recheck_at = None;
                         }
                         self.load_playlist_items_at(&id, 0);
                         if let Some(page) = self.playlist_pages.get(&id) {
@@ -8409,12 +8746,12 @@ impl App {
                     if let Some(image) = pick_image(&artist.images, 64) {
                         self.tint_for(Some(image));
                     }
-                    if let Some(page) = self.artist_pages.get_mut(&id)
-                        && page.top_tracks.needs_load()
+                    if self
+                        .artist_pages
+                        .get(&id)
+                        .is_some_and(|page| page.top_tracks.needs_load())
                     {
-                        page.top_tracks = Loadable::Loading;
-                        self.backend
-                            .api(ApiRequest::ArtistTopTracks { id: id.clone() });
+                        self.request_artist_top_tracks(&id);
                     }
                 }
                 if let Some(page) = self.artist_pages.get_mut(&id) {
@@ -8424,12 +8761,38 @@ impl App {
                     };
                 }
             }
-            ApiResponse::ArtistTopTracks { id, result } => {
+            ApiResponse::ArtistTopTracks {
+                id,
+                generation,
+                result,
+            } => {
+                if self
+                    .artist_pages
+                    .get(&id)
+                    .is_none_or(|page| page.top_tracks_generation != generation)
+                {
+                    return;
+                }
+                // The old Web API request may finish after the session became ready.
+                // Retry only reads started without it, so a persistent failure stops.
+                if result.is_err()
+                    && self.local_ready
+                    && self
+                        .artist_pages
+                        .get(&id)
+                        .is_some_and(|page| page.top_tracks_without_session)
+                {
+                    self.request_artist_top_tracks(&id);
+                    return;
+                }
                 if let Ok(tracks) = &result {
                     let uris: Vec<String> = tracks.iter().map(|track| track.uri.clone()).collect();
                     self.request_contains(uris);
                 }
                 if let Some(page) = self.artist_pages.get_mut(&id) {
+                    if result.is_ok() {
+                        page.top_tracks_without_session = false;
+                    }
                     page.top_tracks = match result {
                         Ok(tracks) => Loadable::Loaded(tracks),
                         Err(error) => Loadable::Failed(friendly_api_error(self.locale, &error)),
@@ -8637,6 +9000,7 @@ impl App {
                     }
                     if result.is_ok() {
                         pending.after_poll = Some(self.remote_poll_seq);
+                        pending.written_at = Some(Instant::now());
                     }
                 }
                 if matches!(action, RemoteAction::Play | RemoteAction::Pause) {
@@ -8742,6 +9106,42 @@ impl App {
         }
     }
 
+    /// Shows a volume Spotify pushed for the device playing elsewhere, such
+    /// as one turned on the speaker itself, without asking the Web API. A
+    /// volume set here and not yet confirmed still wins. A Web API device
+    /// without an id (a restricted one, such as Sonos) is taken to be the
+    /// pushed one, since the push names the device that plays.
+    fn handle_remote_volume(&mut self, device_id: &str, volume: u16) {
+        let Some(device) = self
+            .remote
+            .as_mut()
+            .and_then(|remote| remote.state.device.as_mut())
+        else {
+            return;
+        };
+        if device.id.as_deref().is_some_and(|id| id != device_id) {
+            return;
+        }
+        let percent = volume_to_percent(volume);
+        device.volume_percent = Some(percent);
+        self.pushed_remote_volume = Some(PushedVolume {
+            percent,
+            device_id: device_id.to_owned(),
+            poll_seq: self.remote_poll_seq,
+        });
+    }
+
+    /// When to poll for a change Spotify pushed: after a pending poll
+    /// completes, and at least [`REMOTE_PUSH_SPACING`] after its start. The
+    /// response wakes the app, so waiting for it needs no push timer.
+    fn remote_push_due(&self) -> Option<Instant> {
+        if !self.is_connected() || self.offline || self.remote_poll_pending {
+            return None;
+        }
+        let pushed = self.remote_pushed_at?;
+        Some(pushed.max(self.remote_polled_at + REMOTE_PUSH_SPACING))
+    }
+
     /// Makes the next poll due within 700 ms, whatever the interval: it
     /// counts back from the longest one, so a window hidden meanwhile does
     /// not put a follow-up poll off.
@@ -8777,6 +9177,11 @@ impl App {
     /// page opens once the account is signed in.
     pub fn open_link(&mut self, uri: String) {
         self.actions.push(Action::OpenLink(uri));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_spotify_link(&self) -> Option<&str> {
+        self.pending_link.as_deref()
     }
 
     /// Opens the page behind the pending link once the account is signed
@@ -9964,14 +10369,17 @@ impl App {
                     PlayerCommand::VolumePreview(volume)
                 });
             }
-            Target::Remote(_) if !settle || !self.can_set_volume() => {}
+            Target::Remote(_) if !self.can_set_volume() => {}
+            Target::Remote(_) if !settle && !self.previews_remote_volume() => {}
             Target::Remote(device_id) => {
+                self.soloist_volume_preview = Some(Instant::now());
                 self.remote_volume_request += 1;
                 self.pending_remote_volume = Some(PendingRemoteVolume {
                     percent,
                     device_id: device_id.clone(),
                     request: self.remote_volume_request,
                     after_poll: None,
+                    written_at: None,
                     mismatches: 0,
                 });
                 self.backend.api(ApiRequest::Remote {
@@ -9987,6 +10395,16 @@ impl App {
                 });
             }
         }
+    }
+
+    /// Whether a volume drag may reach the device before the release. Our own
+    /// Soloist takes it over its local socket, so unlike a Web API write it
+    /// spends no request budget; the pace only keeps the commands in order.
+    fn previews_remote_volume(&self) -> bool {
+        self.targets_own_soloist()
+            && self
+                .soloist_volume_preview
+                .is_none_or(|sent| sent.elapsed() >= SOLOIST_VOLUME_PACE)
     }
 
     fn reconcile_remote_volume(&mut self, seq: u64, state: Option<&PlaybackState>) {
@@ -10011,14 +10429,20 @@ impl App {
         let Some(reported) = device.and_then(|device| device.volume_percent) else {
             return;
         };
-        if reported == pending.percent || pending.mismatches > 0 {
+        // Polls after a successful write can lag, a Sonos's by seconds.
+        // Check once more, and hold the chosen volume as long as play and
+        // pause are held, before accepting a volume set elsewhere.
+        let held = pending
+            .written_at
+            .is_some_and(|at| at.elapsed() < PLAYBACK_HOLD);
+        if reported == pending.percent || (pending.mismatches > 0 && !held) {
             self.pending_remote_volume = None;
         } else {
-            // Even the first poll after a successful write can lag. Check
-            // once more before accepting a volume set elsewhere, as for tracks.
-            pending.mismatches += 1;
+            if pending.mismatches == 0 {
+                self.remote_recheck_at = Some(Instant::now() + REMOTE_RECHECK);
+            }
+            pending.mismatches = pending.mismatches.saturating_add(1);
             pending.after_poll = Some(seq);
-            self.remote_recheck_at = Some(Instant::now() + REMOTE_RECHECK);
         }
     }
 
@@ -11336,13 +11760,27 @@ impl App {
                 RowContext::View {
                     uris, context_uri, ..
                 } => {
+                    // The header's Play names no song. With shuffle on it
+                    // starts at a random row, as a whole context does in
+                    // `shuffle_start`; a clicked row still plays first.
+                    let shuffled_start = uri.is_empty() && self.shuffle_wanted && !uris.is_empty();
+                    let index = if shuffled_start {
+                        rand::random_range(0..uris.len()) as u32
+                    } else {
+                        index
+                    };
                     let played = uris.get(index as usize).cloned().map(|uri| PlayedRow {
                         context: context_uri.clone(),
                         view: true,
                         index,
                         uri,
                     });
-                    let (uris, index) = cap_uris(uris.as_ref(), index);
+                    let (uris, index) = if shuffled_start {
+                        // Any row may start, with a full list around it.
+                        cap_uris_around(uris.as_ref(), index)
+                    } else {
+                        cap_uris(uris.as_ref(), index)
+                    };
                     if let Some(uri) = uris.get(index as usize) {
                         self.cache_track_from_context(&context_uri, uri);
                     }
@@ -11854,6 +12292,12 @@ impl App {
                     self.toast(gettext(self.locale, "Link copied"));
                 }
             }
+            Action::CopyText(text) => {
+                if !text.is_empty() {
+                    ctx.copy_text(text);
+                    self.toast(gettext(self.locale, "Copied"));
+                }
+            }
             Action::CopySongs(items) => {
                 let links: Vec<String> = items
                     .iter()
@@ -12360,6 +12804,7 @@ impl App {
                     self.backend.send(Command::AuthorizePlayback);
                 }
             }
+            Action::RequestPlayCounts(uri) => self.request_play_counts(&uri),
             Action::SetPrereleaseSaved { uri, saved } => {
                 if self.local_ready {
                     for page in self.album_pages.values_mut() {
@@ -12391,48 +12836,62 @@ impl App {
                 });
             }
             Action::ClearPlayHistory => {
+                self.storage_usage.invalidate();
                 self.plays.clear();
                 self.plays.save(&self.files, &self.dirs.history_file());
                 self.rebuild_recents();
                 self.toast(gettext(self.locale, "Play history cleared"));
             }
-            Action::ClearArtCache => match self.backend.art().clear_disk_cache() {
-                Ok(bytes) => {
-                    ctx.forget_all_images();
-                    // The media controls hold a path into what was just
-                    // deleted; forget it, or the next sync hands the system
-                    // a file that is no longer there.
-                    self.media_art = None;
-                    self.toast(
-                        // Translators: {size} is a size in megabytes, such as 12.5.
-                        gettext(self.locale, "Cleared {size} MB of artwork")
-                            .replace("{size}", &format!("{:.1}", bytes as f64 / 1_048_576.0)),
-                    );
+            Action::ClearAudioCache => {
+                if !self.clearing_audio_cache {
+                    self.clearing_audio_cache = true;
+                    self.backend.send(Command::ClearAudioCache);
                 }
-                Err(error) => self.toast_error(
-                    // Translators: {error} is an error message.
-                    gettext(self.locale, "Couldn't clear artwork: {error}")
-                        .replace("{error}", &error.to_string()),
-                ),
-            },
+            }
+            Action::ClearArtCache => {
+                self.storage_usage.invalidate();
+                match self.backend.art().clear_disk_cache() {
+                    Ok(bytes) => {
+                        ctx.forget_all_images();
+                        // The media controls hold a path into what was just
+                        // deleted; forget it, or the next sync hands the system
+                        // a file that is no longer there.
+                        self.media_art = None;
+                        self.toast(
+                            // Translators: {size} is a size in megabytes, such as 12.5.
+                            gettext(self.locale, "Cleared {size} MB of artwork")
+                                .replace("{size}", &format!("{:.1}", bytes as f64 / 1_048_576.0)),
+                        );
+                    }
+                    Err(error) => self.toast_error(
+                        // Translators: {error} is an error message.
+                        gettext(self.locale, "Couldn't clear artwork: {error}")
+                            .replace("{error}", &error.to_string()),
+                    ),
+                }
+            }
             Action::ToggleWinampWindow => {
                 // One window at a time: this one closes and the loop in
                 // `main` opens the other kind where each was last.
                 if !self.settings.winamp_window && self.settings.random_skin {
-                    self.winamp.refresh_choices(&self.dirs.skins_dir());
-                    let candidates: Vec<Option<String>> = std::iter::once(None)
-                        .chain(
-                            self.winamp
-                                .choices
-                                .iter()
-                                .map(|choice| Some(choice.name.clone())),
-                        )
-                        .collect();
-                    self.settings.skin = crate::winamp::pick_another(
-                        &candidates,
-                        &self.settings.skin,
-                        &mut rand::rng(),
-                    );
+                    self.winamp.poll_choices();
+                    self.winamp.refresh_choices(&self.dirs.skins_dir(), ctx);
+                    // Until the first listing is back the skin stays as it is.
+                    if self.winamp.choices_known() {
+                        let candidates: Vec<Option<String>> = std::iter::once(None)
+                            .chain(
+                                self.winamp
+                                    .choices
+                                    .iter()
+                                    .map(|choice| Some(choice.name.clone())),
+                            )
+                            .collect();
+                        self.settings.skin = crate::winamp::pick_another(
+                            &candidates,
+                            &self.settings.skin,
+                            &mut rand::rng(),
+                        );
+                    }
                 }
                 self.settings.winamp_window = !self.settings.winamp_window;
                 self.settings_dirty = true;
@@ -13147,7 +13606,13 @@ impl App {
         let polling = self
             .is_connected()
             .then(|| self.connected_repaint_interval());
-        [playing, pending, polling].into_iter().flatten().min()
+        let pushed = self
+            .remote_push_due()
+            .map(|due| due.saturating_duration_since(Instant::now()));
+        [playing, pending, polling, pushed]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// How long the headless loop may sleep after this tick: until the next
@@ -13978,15 +14443,25 @@ fn autoplay_seed(
     near_end.then(|| track.uri.clone())
 }
 
+/// The most songs a plain track list hands the player.
+const MAX_PLAYED_URIS: usize = 500;
+
 /// Caps large track lists at 500 items starting from the selected row.
 fn cap_uris(uris: &[String], index: u32) -> (Vec<String>, u32) {
-    const MAX: usize = 500;
-    if uris.len() <= MAX {
+    if uris.len() <= MAX_PLAYED_URIS {
         return (uris.to_vec(), index);
     }
     let start = (index as usize).min(uris.len().saturating_sub(1));
-    let end = (start + MAX).min(uris.len());
+    let end = (start + MAX_PLAYED_URIS).min(uris.len());
     (uris[start..end].to_vec(), 0)
+}
+
+/// Caps large track lists at 500 items that include the selected row,
+/// moving the window back near the end so it stays full.
+fn cap_uris_around(uris: &[String], index: u32) -> (Vec<String>, u32) {
+    let start = (index as usize).min(uris.len().saturating_sub(MAX_PLAYED_URIS));
+    let end = (start + MAX_PLAYED_URIS).min(uris.len());
+    (uris[start..end].to_vec(), index - start as u32)
 }
 
 fn evict_lru_map<V>(
@@ -14053,6 +14528,158 @@ mod tests {
     use crate::api::models::{
         Episode, Image, Page as ApiPage, ResumePoint, SavedEpisode, SavedTrack, SearchResults,
     };
+
+    #[test]
+    fn popular_tracks_retry_once_when_the_session_becomes_ready_in_either_order() {
+        for soloist in [false, true] {
+            for error_after_ready in [false, true] {
+                let mut app = headless_app();
+                app.settings.soloist_enabled = soloist;
+                app.local_ready = false;
+                app.artist_pages
+                    .insert("artist".into(), ArtistPage::default());
+                app.handle_api(ApiResponse::Artist {
+                    id: "artist".into(),
+                    result: Ok(Artist {
+                        id: "artist".into(),
+                        ..Default::default()
+                    }),
+                });
+                assert!(app.artist_pages["artist"].top_tracks_without_session);
+                let ready = || LocalPlayback::Ready {
+                    device_id: "device".into(),
+                };
+                let first_generation = app.artist_pages["artist"].top_tracks_generation;
+                let refused = |generation| ApiResponse::ArtistTopTracks {
+                    id: "artist".into(),
+                    generation,
+                    result: Err(crate::api::ApiError::Status {
+                        status: 403,
+                        message: "Forbidden".into(),
+                    }),
+                };
+                if error_after_ready {
+                    app.handle_playback(ready());
+                    assert!(
+                        app.artist_pages["artist"].top_tracks_without_session,
+                        "wait for the pending request; do not duplicate it"
+                    );
+                    app.handle_api(refused(first_generation));
+                } else {
+                    app.handle_api(refused(first_generation));
+                    assert!(matches!(
+                        app.artist_pages["artist"].top_tracks,
+                        Loadable::Failed(_)
+                    ));
+                    app.handle_playback(ready());
+                }
+                assert!(app.artist_pages["artist"].top_tracks.is_loading());
+                assert!(!app.artist_pages["artist"].top_tracks_without_session);
+                app.handle_api(refused(app.artist_pages["artist"].top_tracks_generation));
+                app.handle_playback(ready());
+                assert!(
+                    matches!(app.artist_pages["artist"].top_tracks, Loadable::Failed(_)),
+                    "a refused session retry must not loop"
+                );
+                app.backend.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn popular_tracks_ignore_old_replies_after_page_recreation_and_account_reset() {
+        for reset_account in [false, true] {
+            let mut app = headless_app();
+            app.local_ready = false;
+            app.artist_pages
+                .insert("artist".into(), ArtistPage::default());
+            app.request_artist_top_tracks("artist");
+            let old = app.artist_pages["artist"].top_tracks_generation;
+            if reset_account {
+                app.reset_data();
+            } else {
+                app.artist_pages.remove("artist");
+            }
+            app.artist_pages
+                .insert("artist".into(), ArtistPage::default());
+            app.local_ready = false;
+            app.request_artist_top_tracks("artist");
+            let current = app.artist_pages["artist"].top_tracks_generation;
+            assert_ne!(old, current);
+            app.local_ready = true;
+            let failure = |generation| ApiResponse::ArtistTopTracks {
+                id: "artist".into(),
+                generation,
+                result: Err(crate::api::ApiError::Status {
+                    status: 403,
+                    message: "Forbidden".into(),
+                }),
+            };
+            app.handle_api(failure(old));
+            assert_eq!(
+                app.artist_pages["artist"].top_tracks_generation, current,
+                "old failure must not start a retry"
+            );
+            assert!(app.artist_pages["artist"].top_tracks.is_loading());
+            let tracks = vec![Track {
+                id: Some("current".into()),
+                ..Default::default()
+            }];
+            app.handle_api(ApiResponse::ArtistTopTracks {
+                id: "artist".into(),
+                generation: current,
+                result: Ok(tracks.clone()),
+            });
+            app.handle_api(failure(old));
+            app.handle_api(ApiResponse::ArtistTopTracks {
+                id: "artist".into(),
+                generation: old,
+                result: Ok(Vec::new()),
+            });
+            assert_eq!(
+                app.artist_pages["artist"].top_tracks.get(),
+                Some(&tracks),
+                "stale failure or success must not replace current tracks"
+            );
+            app.backend.shutdown();
+        }
+    }
+
+    #[test]
+    fn popular_tracks_keep_successful_lists_when_the_session_connects() {
+        for tracks in [
+            Vec::new(),
+            vec![Track {
+                id: Some("track".into()),
+                ..Default::default()
+            }],
+        ] {
+            let mut app = headless_app();
+            app.local_ready = false;
+            app.artist_pages
+                .insert("artist".into(), ArtistPage::default());
+            app.request_artist_top_tracks("artist");
+            app.handle_api(ApiResponse::ArtistTopTracks {
+                id: "artist".into(),
+                generation: app.artist_pages["artist"].top_tracks_generation,
+                result: Ok(tracks.clone()),
+            });
+            app.handle_playback(LocalPlayback::Ready {
+                device_id: "device".into(),
+            });
+            assert_eq!(
+                app.artist_pages["artist"].top_tracks.get().unwrap().len(),
+                tracks.len()
+            );
+            assert!(!app.artist_pages["artist"].top_tracks_without_session);
+            app.reset_data();
+            assert!(
+                app.artist_pages.is_empty(),
+                "retry state must not survive sign-out"
+            );
+            app.backend.shutdown();
+        }
+    }
 
     /// #623: the missing-output message the sink reports is the one the
     /// catalogues translate.
@@ -16011,6 +16638,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recommendations_endpoint_denial_omits_only_an_unavailable_shelf() {
+        for status in [403, 404] {
+            let mut app = listener_app();
+            let generation = app.home.generation;
+            app.home.recommendations = Loadable::Loading;
+            app.handle_api(ApiResponse::Recommendations {
+                generation: generation.wrapping_add(1),
+                result: Err(crate::api::ApiError::Status {
+                    status,
+                    message: "denied".into(),
+                }),
+            });
+            assert!(
+                app.home.recommendations.is_loading(),
+                "ignore stale responses"
+            );
+            app.handle_api(ApiResponse::Recommendations {
+                generation,
+                result: Err(crate::api::ApiError::Status {
+                    status,
+                    message: "denied".into(),
+                }),
+            });
+            assert_eq!(app.home.recommendations.get(), Some(&Vec::new()));
+            let tracks = vec![song("spotify:track:recommended")];
+            app.handle_api(ApiResponse::Recommendations {
+                generation,
+                result: Ok(tracks.clone()),
+            });
+            assert_eq!(
+                app.home.recommendations.get(),
+                Some(&tracks),
+                "later success restores the shelf"
+            );
+            app.handle_api(ApiResponse::Recommendations {
+                generation,
+                result: Err(crate::api::ApiError::Status {
+                    status,
+                    message: "denied".into(),
+                }),
+            });
+            assert_eq!(
+                app.home.recommendations.get(),
+                Some(&tracks),
+                "keep useful results"
+            );
+        }
+    }
+
+    #[test]
+    fn recommendations_transient_and_authentication_errors_stay_visible() {
+        for error in [
+            crate::api::ApiError::Network("offline".into()),
+            crate::api::ApiError::RateLimited,
+            crate::api::ApiError::NotSignedIn,
+            crate::api::ApiError::Decode("invalid response".into()),
+            crate::api::ApiError::Status {
+                status: 401,
+                message: "expired".into(),
+            },
+            crate::api::ApiError::Status {
+                status: 500,
+                message: "server error".into(),
+            },
+        ] {
+            for initial in [Loadable::Loading, Loadable::Loaded(Vec::new())] {
+                let mut app = listener_app();
+                app.home.recommendations = initial;
+                app.handle_api(ApiResponse::Recommendations {
+                    generation: app.home.generation,
+                    result: Err(error.clone()),
+                });
+                assert!(matches!(app.home.recommendations, Loadable::Failed(_)));
+            }
+        }
+    }
+
     /// Recommendations are seeded with the listener's top songs. An account
     /// Spotify has no top songs for yet has nothing to seed them with, so
     /// the shelf is left empty, and hidden, instead of loading forever.
@@ -17389,11 +18094,10 @@ mod tests {
             (Some(ordinary), vec![Fullscreen(false)]),
             (Some(maximized), vec![Fullscreen(false), Maximized(true)]),
             (Some(full_screen), vec![Fullscreen(true)]),
-            // A session from before this was remembered: Windows can only
-            // have been in fullscreen lyrics, other desktops keep the state.
+            // Nothing remembered: only macOS keeps the restored state.
             (
                 None,
-                if cfg!(windows) {
+                if STARTS_WINDOWED {
                     vec![Fullscreen(false)]
                 } else {
                     vec![]
@@ -21930,6 +22634,16 @@ mod tests {
             std::fs::write(skins.join(name), b"skin").unwrap();
         }
         app.apply(Action::SetRandomSkin(true), &ctx);
+        app.settings.winamp_window = false;
+        app.switch_intent = false;
+        app.apply(Action::ToggleWinampWindow, &ctx);
+        assert_eq!(app.settings.skin, None, "nothing to pick from until listed");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.winamp.choices_known() {
+            assert!(Instant::now() < deadline, "the listing never came back");
+            app.winamp.poll_choices();
+            std::thread::sleep(Duration::from_millis(5));
+        }
         for _ in 0..6 {
             let before = app.settings.skin.clone();
             app.settings.winamp_window = false;
@@ -24599,6 +25313,43 @@ mod tests {
     }
 
     #[test]
+    fn audio_clear_failure_releases_the_button_and_refreshes_sizes_offline() {
+        let mut app = headless_app();
+        app.offline = true;
+        app.clearing_audio_cache = true;
+        app.storage_usage.sizes = [crate::storage::Size::Bytes(100); 3];
+        app.handle_backend_events(vec![Event::AudioCacheCleared(Err(
+            crate::storage::ClearAudioError::Failed("fixture failure".into()),
+        ))]);
+        assert!(!app.clearing_audio_cache);
+        assert_eq!(app.storage_usage.sizes, [crate::storage::Size::Checking; 3]);
+        assert_eq!(
+            app.toasts.last().unwrap().message,
+            "Couldn't clear audio cache: fixture failure"
+        );
+    }
+
+    #[test]
+    fn a_clear_that_left_files_says_so_and_its_refusals_are_worded_here() {
+        let mut app = headless_app();
+        app.handle_backend_events(vec![Event::AudioCacheCleared(Ok(
+            crate::storage::AudioCleared {
+                bytes: 2_000,
+                skipped: 2,
+            },
+        ))]);
+        let shown = |app: &App| app.toasts.last().unwrap().message.clone();
+        assert_eq!(shown(&app), "2 unrecognized files were left in place.");
+        app.handle_backend_events(vec![Event::AudioCacheCleared(Err(
+            crate::storage::ClearAudioError::Reconnecting,
+        ))]);
+        assert_eq!(
+            shown(&app),
+            "Couldn't clear audio cache: Playback is reconnecting. Try again once it is ready."
+        );
+    }
+
+    #[test]
     fn thumbnail_transport_tracks_optimistic_pause_and_window_recreation() {
         use crate::thumbbar::{Icon, ThumbCommand, buttons};
         let mut app = headless_app();
@@ -25845,16 +26596,25 @@ mod tests {
         let album = "spotify:album:a";
         app.network_reachable = true;
         app.local_ready = false;
-        app.request_play_counts(album);
+        app.apply(
+            Action::RequestPlayCounts(album.into()),
+            &egui::Context::default(),
+        );
         assert_eq!(app.play_count_reads.get(album), None);
 
         app.local_ready = true;
-        app.request_play_counts(album);
+        app.apply(
+            Action::RequestPlayCounts(album.into()),
+            &egui::Context::default(),
+        );
         assert_eq!(app.play_count_reads.get(album), Some(&PlayCountRead::Asked));
         assert!(!app.has_play_counts(album));
 
-        app.receive_play_counts(album.into(), Err("unavailable".into()));
-        app.request_play_counts(album);
+        app.receive_play_counts(album.into(), 0, Err("unavailable".into()));
+        app.apply(
+            Action::RequestPlayCounts(album.into()),
+            &egui::Context::default(),
+        );
         assert!(matches!(
             app.play_count_reads.get(album),
             Some(PlayCountRead::Failed(_))
@@ -25863,14 +26623,333 @@ mod tests {
 
         app.receive_play_counts(
             album.into(),
-            Ok(HashMap::from([("spotify:track:t".to_string(), 5)])),
+            0,
+            Ok(crate::session_reads::PageMetadata {
+                play_counts: HashMap::from([("spotify:track:t".to_string(), 5)]),
+                ..Default::default()
+            }),
         );
         assert!(app.has_play_counts(album));
         assert_eq!(app.play_counts.get("spotify:track:t"), Some(&5));
 
         // An answer with no counts shows no column.
-        app.receive_play_counts("spotify:artist:b".into(), Ok(HashMap::new()));
+        app.receive_play_counts("spotify:artist:b".into(), 0, Ok(Default::default()));
         assert!(!app.has_play_counts("spotify:artist:b"));
+
+        // Monthly listeners alone are shown, but the songs' counts are still
+        // missing and asked for again.
+        let artist = "spotify:artist:c";
+        let listeners = crate::session_reads::PageMetadata {
+            play_counts: HashMap::from([(artist.to_string(), 9)]),
+            ..Default::default()
+        };
+        app.receive_play_counts(artist.into(), 0, Ok(listeners));
+        assert_eq!(app.play_counts.get(artist), Some(&9));
+        assert!(!app.has_play_counts(artist));
+        assert!(matches!(
+            app.play_count_reads.get(artist),
+            Some(PlayCountRead::Failed(_))
+        ));
+    }
+
+    /// A change Spotify pushes for another device is polled at once. A
+    /// burst of them, such as a turned volume knob, waits for the spacing
+    /// and folds into one more poll.
+    #[test]
+    fn a_pushed_change_polls_at_once_and_a_burst_waits_its_turn() {
+        let mut app = headless_app();
+        app.auth = AuthStatus::Connected {
+            username: "alice".into(),
+        };
+        assert_eq!(app.remote_push_due(), None, "nothing pushed, nothing due");
+
+        app.remote_polled_at = Instant::now() - REMOTE_POLL_ACTIVE;
+        app.remote_pushed_at = Some(Instant::now());
+        assert!(
+            app.remote_push_due()
+                .is_some_and(|due| due <= Instant::now()),
+            "the last poll was long ago, so the push polls now"
+        );
+        assert_eq!(app.next_pass(), Some(Duration::ZERO));
+
+        app.remote_polled_at = Instant::now();
+        app.remote_pushed_at = Some(Instant::now());
+        let wait = app.next_pass().expect("a pass is due for the push");
+        assert!(
+            wait > Duration::from_millis(500) && wait <= REMOTE_PUSH_SPACING,
+            "a push right after a poll waits for the spacing, not the 4 s poll: {wait:?}"
+        );
+    }
+
+    /// A command's own push polls at once and stands in for the recheck the
+    /// command planned. A push from before the command does not.
+    #[test]
+    fn a_push_after_a_command_stands_in_for_its_recheck() {
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        app.auth = AuthStatus::Connected {
+            username: "alice".into(),
+        };
+        app.settings.check_for_updates = false;
+        app.poll_remote(false);
+        app.remote_poll_pending = false;
+
+        for (pushed_ago, stands_in) in [(Duration::ZERO, true), (Duration::from_secs(2), false)] {
+            let seq = app.remote_poll_seq;
+            app.remote_poll_pending = false;
+            app.remote_polled_at = Instant::now() - REMOTE_PUSH_SPACING;
+            app.remote_recheck_at = Some(Instant::now() + REMOTE_RECHECK);
+            app.remote_pushed_at = Some(Instant::now() - pushed_ago);
+            app.tick(&ctx);
+            assert_eq!(app.remote_poll_seq, seq + 1, "the push polls at once");
+            assert_eq!(app.remote_recheck_at.is_none(), stands_in);
+        }
+    }
+
+    /// Slow polls must still update playback during a burst of pushes. A
+    /// push that arrives after the poll started asks for one follow-up.
+    #[test]
+    fn pushed_changes_wait_for_a_slow_poll_and_keep_its_response() {
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        app.auth = AuthStatus::Connected {
+            username: "alice".into(),
+        };
+        app.settings.check_for_updates = false;
+        app.poll_remote(false);
+
+        for progress_ms in [1_000, 2_000] {
+            let seq = app.remote_poll_seq;
+            app.remote_polled_at = Instant::now() - Duration::from_secs(2);
+            let pushed = Instant::now();
+            for _ in 0..3 {
+                app.remote_pushed_at.get_or_insert(pushed);
+                app.tick(&ctx);
+                assert_eq!(app.remote_poll_seq, seq, "the pending poll still counts");
+                assert_eq!(app.remote_pushed_at, Some(pushed));
+                assert_eq!(app.remote_push_due(), None, "wait for the response");
+                assert_ne!(app.next_pass(), Some(Duration::ZERO), "no timer spin");
+            }
+
+            app.handle_api(ApiResponse::PlaybackState {
+                seq,
+                result: Ok(Some(PlaybackState {
+                    progress_ms: Some(progress_ms),
+                    ..Default::default()
+                })),
+            });
+            assert!(!app.remote_poll_pending);
+            assert_eq!(
+                app.remote.as_ref().unwrap().state.progress_ms,
+                Some(progress_ms)
+            );
+            assert_eq!(app.remote_pushed_at, Some(pushed));
+
+            app.tick(&ctx);
+            assert_eq!(app.remote_poll_seq, seq + 1, "one follow-up for the burst");
+            assert!(app.remote_poll_pending);
+            assert_eq!(app.remote_pushed_at, None);
+        }
+        app.backend.shutdown();
+    }
+
+    /// A regular poll started after a push already covers it, even if its
+    /// response takes longer than the push spacing.
+    #[test]
+    fn a_poll_started_after_a_push_covers_it() {
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        app.auth = AuthStatus::Connected {
+            username: "alice".into(),
+        };
+        app.settings.check_for_updates = false;
+        app.remote_polled_at = Instant::now() - REMOTE_POLL_UNSEEN;
+        app.remote_pushed_at = Some(Instant::now());
+        app.tick(&ctx);
+        let seq = app.remote_poll_seq;
+        assert!(app.remote_poll_pending);
+        assert_eq!(
+            app.remote_pushed_at, None,
+            "the regular poll covers the push"
+        );
+
+        app.remote_polled_at = Instant::now() - Duration::from_secs(2);
+        app.tick(&ctx);
+        assert_eq!(app.remote_poll_seq, seq);
+        app.handle_api(ApiResponse::PlaybackState {
+            seq,
+            result: Ok(None),
+        });
+        app.tick(&ctx);
+        assert_eq!(app.remote_poll_seq, seq, "no redundant follow-up");
+        assert!(!app.remote_poll_pending);
+        app.backend.shutdown();
+    }
+
+    /// An empty or failed read also releases the pending poll, so a newer
+    /// push gets its follow-up instead of being lost or waiting forever.
+    #[test]
+    fn a_push_after_a_poll_retries_after_an_empty_or_failed_response() {
+        let ctx = egui::Context::default();
+        for result in [
+            Ok(None),
+            Err(crate::api::ApiError::Network("read failed".into())),
+        ] {
+            let mut app = headless_app();
+            app.auth = AuthStatus::Connected {
+                username: "alice".into(),
+            };
+            app.settings.check_for_updates = false;
+            app.poll_remote(false);
+            let seq = app.remote_poll_seq;
+            app.remote_polled_at = Instant::now() - Duration::from_secs(2);
+            app.remote_pushed_at = Some(Instant::now());
+            app.tick(&ctx);
+            assert_eq!(app.remote_poll_seq, seq);
+            app.handle_api(ApiResponse::PlaybackState { seq, result });
+            assert!(!app.remote_poll_pending);
+            app.tick(&ctx);
+            assert_eq!(app.remote_poll_seq, seq + 1);
+            assert!(app.remote_poll_pending);
+            assert_eq!(app.remote_pushed_at, None);
+            app.backend.shutdown();
+        }
+    }
+
+    /// A push left over from before signing out or going offline asks for
+    /// no pass, or the logic would spin.
+    #[test]
+    fn a_push_while_disconnected_asks_for_nothing() {
+        let mut app = headless_app();
+        app.remote_pushed_at = Some(Instant::now());
+        assert_eq!(app.remote_push_due(), None);
+        app.auth = AuthStatus::Connected {
+            username: "alice".into(),
+        };
+        app.offline = true;
+        assert_eq!(app.remote_push_due(), None);
+    }
+
+    #[test]
+    fn an_album_without_counts_is_asked_again() {
+        let mut app = headless_app();
+        app.local_ready = true;
+        app.network_reachable = true;
+        let album = "spotify:album:a";
+        app.receive_play_counts(album.into(), 0, Ok(Default::default()));
+        assert!(matches!(
+            app.play_count_reads[album],
+            PlayCountRead::Failed(_)
+        ));
+        app.play_count_reads.insert(
+            album.into(),
+            PlayCountRead::Failed(Instant::now() - PLAY_COUNT_RETRY),
+        );
+        app.request_play_counts(album);
+        assert_eq!(app.play_count_reads[album], PlayCountRead::Asked);
+    }
+
+    /// Both empty and populated artist overviews expire without request storms;
+    /// existing counts and countdowns stay visible during a failed refresh.
+    #[test]
+    fn artist_metadata_revalidates_after_a_bounded_interval() {
+        for has_counts in [false, true] {
+            let mut app = headless_app();
+            let uri = "spotify:artist:test";
+            app.local_ready = true;
+            app.network_reachable = true;
+            let data = || crate::session_reads::PageMetadata {
+                play_counts: if has_counts {
+                    HashMap::from([("spotify:track:t".to_string(), 5)])
+                } else {
+                    HashMap::new()
+                },
+                ..Default::default()
+            };
+            app.receive_play_counts(uri.into(), 0, Ok(data()));
+            let completed = app.play_count_reads[uri];
+            app.request_play_counts(uri);
+            assert_eq!(app.play_count_reads[uri], completed);
+            app.artist_metadata_reads.get_mut(uri).unwrap().received_at =
+                Instant::now() - ARTIST_METADATA_REFRESH;
+            app.network_reachable = false;
+            app.request_play_counts(uri);
+            assert_eq!(app.play_count_reads[uri], completed);
+            app.network_reachable = true;
+            app.request_play_counts(uri);
+            assert_eq!(app.play_count_reads[uri], PlayCountRead::Asked);
+            assert_eq!(app.has_play_counts(uri), has_counts);
+            app.request_play_counts(uri);
+            assert_eq!(app.play_count_reads[uri], PlayCountRead::Asked);
+            app.receive_play_counts(uri.into(), 0, Err("offline".into()));
+            app.request_play_counts(uri);
+            assert!(matches!(
+                app.play_count_reads[uri],
+                PlayCountRead::Failed(_)
+            ));
+            assert_eq!(app.has_play_counts(uri), has_counts);
+            app.play_count_reads.insert(
+                uri.into(),
+                PlayCountRead::Failed(Instant::now() - PLAY_COUNT_RETRY),
+            );
+            app.request_play_counts(uri);
+            assert_eq!(app.play_count_reads[uri], PlayCountRead::Asked);
+            let artist =
+                serde_json::from_str(include_str!("testdata/artist-prerelease.json")).unwrap();
+            let mut replacement = data();
+            replacement.upcoming =
+                crate::prerelease::UpcomingRelease::from_artist(&artist).unwrap();
+            app.receive_play_counts(uri.into(), 0, Ok(replacement));
+            assert_eq!(app.artist_prereleases[uri].name, "Hollowbody");
+            app.request_play_counts(uri);
+            assert_eq!(app.play_count_reads[uri], completed);
+            app.artist_metadata_reads.get_mut(uri).unwrap().received_at =
+                Instant::now() - ARTIST_METADATA_REFRESH;
+            app.request_play_counts(uri);
+            assert_eq!(app.play_count_reads[uri], PlayCountRead::Asked);
+            assert_eq!(app.artist_prereleases[uri].name, "Hollowbody");
+            let mut next = data();
+            let mut upcoming = app.artist_prereleases[uri].clone();
+            upcoming.name = "Next announcement".into();
+            next.upcoming = Some(upcoming);
+            app.receive_play_counts(uri.into(), 0, Ok(next));
+            assert_eq!(app.artist_prereleases[uri].name, "Next announcement");
+            app.reset_data();
+            assert!(app.artist_metadata_reads.is_empty());
+        }
+    }
+
+    #[test]
+    fn artist_prerelease_survives_failure_but_not_absence_or_sign_out() {
+        let mut app = headless_app();
+        let uri = "spotify:artist:04GCjO1r1hPelibCUq9S8H";
+        let artist = serde_json::from_str(include_str!("testdata/artist-prerelease.json")).unwrap();
+        let data = || crate::session_reads::PageMetadata {
+            upcoming: crate::prerelease::UpcomingRelease::from_artist(&artist).unwrap(),
+            ..Default::default()
+        };
+        app.receive_play_counts(uri.into(), 0, Ok(data()));
+        assert_eq!(app.artist_prereleases[uri].name, "Hollowbody");
+        assert!(
+            !app.has_play_counts(uri),
+            "a prerelease does not invent play counts"
+        );
+        assert_eq!(app.play_count_reads[uri], PlayCountRead::Empty);
+        app.receive_play_counts(uri.into(), 0, Err("temporary failure".into()));
+        assert!(app.artist_prereleases.contains_key(uri));
+        app.receive_play_counts(uri.into(), 0, Ok(Default::default()));
+        assert!(!app.artist_prereleases.contains_key(uri));
+        app.receive_play_counts(uri.into(), 0, Ok(data()));
+        app.reset_data();
+        assert!(app.artist_prereleases.is_empty());
+        assert!(app.play_count_reads.is_empty());
+        app.receive_play_counts(uri.into(), 0, Ok(data()));
+        assert!(
+            app.artist_prereleases.is_empty(),
+            "ignore the signed-out session's answer"
+        );
+        app.receive_play_counts(uri.into(), app.play_count_generation, Ok(data()));
+        assert_eq!(app.artist_prereleases[uri].name, "Hollowbody");
     }
 
     #[test]
@@ -27256,7 +28335,8 @@ mod tests {
             }
             let page = &app.playlist_pages["edited"];
             assert!(!page.items.loading, "failed refresh must stop spinning");
-            assert!(page.items.error.is_some());
+            // A lagging snapshot is waited out without an error.
+            assert_eq!(page.items.error.is_some(), network_failure);
             assert_eq!(page.items.items.len(), 1);
             assert!(page.local_additions.contains("spotify:track:new"));
             assert_eq!(page.optimistic_snapshot.as_deref(), Some("written"));
@@ -27278,6 +28358,66 @@ mod tests {
             app.handle_api(metadata("written"));
             assert_eq!(app.backend.take_playlist_item_requests().len(), 1);
         }
+    }
+
+    #[test]
+    fn scrolling_past_a_snapshot_that_never_caught_up_says_why_it_stopped() {
+        let mut app = headless_app();
+        let id = "lagging";
+        let page = app.playlist_pages.entry(id.to_string()).or_default();
+        page.optimistic_snapshot = Some("written".into());
+        page.snapshot_rechecks = 4;
+        app.load_more(Page::Playlist(id.into()));
+        assert!(app.playlist_pages[id].items.error.is_some());
+    }
+
+    #[test]
+    fn a_lagging_playlist_snapshot_is_asked_again_later_without_an_error() {
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        app.playlist_pages.insert(
+            "best".into(),
+            PlaylistPage {
+                generation: 4,
+                optimistic_snapshot: Some("after".into()),
+                refresh_after_write: true,
+                items: PagedList {
+                    items: vec![cached_playlist_row("spotify:track:one")],
+                    total: Some(1),
+                    loaded_once: true,
+                    loading: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let stale = || ApiResponse::Playlist {
+            id: "best".into(),
+            generation: 4,
+            result: Ok(Playlist {
+                id: "best".into(),
+                snapshot_id: Some("before".into()),
+                ..Default::default()
+            }),
+        };
+
+        app.handle_api(stale());
+        let due = app.playlist_pages["best"]
+            .snapshot_recheck_at
+            .expect("asked again");
+        assert!(
+            due > Instant::now() + PLAYLIST_SNAPSHOT_RECHECK / 2,
+            "not at once"
+        );
+
+        for _ in 0..4 {
+            app.handle_api(stale());
+        }
+        let page = &app.playlist_pages["best"];
+        assert!(page.items.error.is_none());
+        assert!(!page.items.loading);
+        assert!(!page.refresh_after_write);
+        assert_eq!(page.items.items.len(), 1, "the written rows stay");
     }
 
     #[test]
@@ -27334,6 +28474,7 @@ mod tests {
         assert_eq!(page.items.total, Some(2));
         assert_eq!(page.items.items.len(), 2);
         assert_eq!(page.snapshot_rechecks, 1);
+        assert!(page.snapshot_recheck_at.is_some());
 
         app.handle_api(ApiResponse::Playlist {
             id: "best".into(),
@@ -27349,6 +28490,7 @@ mod tests {
         let page = &app.playlist_pages["best"];
         assert_eq!(page.optimistic_snapshot, None);
         assert_eq!(page.snapshot_rechecks, 0);
+        assert_eq!(page.snapshot_recheck_at, None, "nothing left to ask again");
         assert_eq!(page.items.total, Some(2));
     }
 
@@ -29423,15 +30565,13 @@ mod tests {
         app.soloist_audio = true;
         let native_mac = cfg!(all(target_os = "macos", feature = "soloist-native-audio"));
         let builtin = app.settings.volume;
-        // Slider motion changes the local fader at once, with no Spotify write.
+        // Slider motion changes the volume at once: the local fader on a Mac,
+        // otherwise a command over Soloist's own socket.
         app.set_volume(25, false);
-        assert_eq!(
-            app.now_playing().unwrap().volume_percent,
-            if native_mac { 25 } else { 40 }
-        );
+        assert_eq!(app.now_playing().unwrap().volume_percent, 25);
         app.set_volume(0, true);
         assert_eq!(app.now_playing().unwrap().volume_percent, 0);
-        assert_eq!(app.remote_volume_request, u64::from(!native_mac));
+        assert_eq!(app.remote_volume_request, if native_mac { 0 } else { 2 });
         assert_eq!(app.settings.volume, builtin);
         if native_mac {
             assert!(app.pending_remote_volume.is_none());
@@ -29460,6 +30600,110 @@ mod tests {
             assert_eq!(app.remote_volume_request, 2);
             assert_eq!(app.backend.soloist_output_volume.percent(), 5);
         }
+        app.backend.shutdown();
+    }
+
+    /// Dragging moves Soloist's volume as you go (#1136): it costs no Web API
+    /// request. Any other device still gets one write, on release.
+    #[test]
+    fn a_volume_drag_reaches_our_own_soloist_before_the_release() {
+        let mut app = remote_volume_app();
+        app.set_volume(40, false);
+        assert!(app.pending_remote_volume.is_none());
+
+        app.soloist_device_id = app
+            .remote
+            .as_ref()
+            .unwrap()
+            .state
+            .device
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        app.set_volume(41, false);
+        assert_eq!(app.pending_remote_volume.as_ref().unwrap().percent, 41);
+
+        // Inside the pace the drag waits, but the release always goes out.
+        app.set_volume(42, false);
+        assert_eq!(app.pending_remote_volume.as_ref().unwrap().percent, 41);
+        app.set_volume(43, true);
+        assert_eq!(app.pending_remote_volume.as_ref().unwrap().percent, 43);
+    }
+
+    /// The player bar's slider hands the drag to `set_volume`, which decides
+    /// what reaches a remote device; held down, it already moves Soloist.
+    #[test]
+    fn dragging_the_volume_slider_moves_our_own_soloist_before_the_release() {
+        use egui::accesskit::Role;
+        fn draw(
+            ctx: &egui::Context,
+            app: &mut App,
+            time: u32,
+            events: Vec<egui::Event>,
+        ) -> egui::accesskit::TreeUpdate {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 800.0),
+                    )),
+                    time: Some(time as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.frame_ui(ui),
+            );
+            output.textures_delta.clear();
+            output.platform_output.accesskit_update.unwrap()
+        }
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = remote_volume_app();
+        app.attach(&ctx);
+        app.soloist_device_id = app
+            .remote
+            .as_ref()
+            .unwrap()
+            .state
+            .device
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        draw(&ctx, &mut app, 0, vec![]);
+        let tree = draw(&ctx, &mut app, 1, vec![]);
+        let slider = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::Slider && node.label() == Some("Volume (%)"))
+            .and_then(|(_, node)| node.bounds())
+            .expect("the player bar's volume slider");
+        let y = ((slider.y0 + slider.y1) / 2.0) as f32;
+        let at = |fraction: f64| egui::pos2((slider.x0 + slider.width() * fraction) as f32, y);
+        draw(
+            &ctx,
+            &mut app,
+            2,
+            vec![
+                egui::Event::PointerMoved(at(0.9)),
+                egui::Event::PointerButton {
+                    pos: at(0.9),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        // The press itself previews the volume, so let the pace pass and see
+        // the move reach Soloist too.
+        app.soloist_volume_preview = None;
+        draw(&ctx, &mut app, 3, vec![egui::Event::PointerMoved(at(0.8))]);
+        let pending = app.pending_remote_volume.as_ref().map(|p| p.percent);
+        assert!(
+            pending.is_some_and(|percent| (75..=85).contains(&percent)),
+            "the held slider reached Soloist: {pending:?}"
+        );
         app.backend.shutdown();
     }
 
@@ -29524,9 +30768,39 @@ mod tests {
         report_remote_volume(&mut app, 2, Some(35));
         assert_eq!(app.now_playing().unwrap().volume_percent, 65);
         assert!(app.pending_remote_volume.is_some());
+        app.pending_remote_volume.as_mut().unwrap().written_at =
+            Some(Instant::now() - PLAYBACK_HOLD);
         report_remote_volume(&mut app, 3, Some(35));
         assert!(app.pending_remote_volume.is_none());
         assert_eq!(app.now_playing().unwrap().volume_percent, 35);
+        app.backend.shutdown();
+    }
+
+    /// A Sonos reports its old volume for seconds after a write Spotify
+    /// accepted. The slider stays where it was put instead of jumping back
+    /// and forth, and waiting asks Spotify no more often.
+    #[test]
+    fn remote_volume_holds_through_a_device_that_reports_it_late() {
+        let mut app = remote_volume_app();
+        app.set_volume(65, true);
+        app.handle_api(ApiResponse::Remote {
+            action: RemoteAction::Volume {
+                request: app.remote_volume_request,
+            },
+            result: Ok(()),
+        });
+        report_remote_volume(&mut app, 1, Some(35));
+        assert!(app.remote_recheck_at.is_some());
+        app.remote_recheck_at = None;
+        for seq in 2..5 {
+            report_remote_volume(&mut app, seq, Some(35));
+            assert_eq!(app.now_playing().unwrap().volume_percent, 65);
+            assert!(app.pending_remote_volume.is_some());
+        }
+        assert!(app.remote_recheck_at.is_none());
+        report_remote_volume(&mut app, 5, Some(65));
+        assert!(app.pending_remote_volume.is_none());
+        assert_eq!(app.now_playing().unwrap().volume_percent, 65);
         app.backend.shutdown();
     }
 
@@ -29747,6 +31021,112 @@ mod tests {
             crate::ui::devices::device_icon(now.device_kind.as_deref().unwrap()),
             crate::theme::Icon::Smartphone
         ));
+        app.backend.shutdown();
+    }
+
+    /// A volume turned on the speaker itself shows as Spotify pushes it,
+    /// without a poll, and a poll already on its way cannot undo it. A
+    /// volume set here and not yet confirmed still wins.
+    #[test]
+    fn a_pushed_volume_shows_at_once_and_outlasts_a_late_poll() {
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        app.attach(&ctx);
+        crate::demo::populate(&mut app);
+        app.local_ready = false;
+        app.frame_now = None;
+        let device = app.remote.as_mut().unwrap().state.device.as_mut().unwrap();
+        device.id = None;
+        device.is_restricted = true;
+        device.volume_percent = Some(40);
+        assert!(matches!(app.target(), Target::Remote(_)));
+
+        app.handle_remote_volume("sonos", percent_to_volume(55));
+        assert_eq!(app.now_playing().unwrap().volume_percent, 55);
+
+        // Unknown and matching identified snapshots from a poll sent before
+        // the push keep the pushed volume.
+        for id in [None, Some("sonos")] {
+            let mut state = app.remote.as_ref().unwrap().state.clone();
+            let device = state.device.as_mut().unwrap();
+            device.id = id.map(str::to_owned);
+            device.volume_percent = Some(40);
+            app.handle_api(ApiResponse::PlaybackState {
+                seq: app.remote_poll_seq,
+                result: Ok(Some(state)),
+            });
+            assert!(app.pushed_remote_volume.is_some());
+            assert_eq!(app.now_playing().unwrap().volume_percent, 55);
+        }
+
+        app.pending_remote_volume = Some(PendingRemoteVolume {
+            percent: 20,
+            device_id: Some("sonos".into()),
+            request: 1,
+            after_poll: None,
+            mismatches: 0,
+            written_at: None,
+        });
+        app.handle_remote_volume("sonos", percent_to_volume(60));
+        assert_eq!(
+            app.now_playing().unwrap().volume_percent,
+            20,
+            "a volume set here and not yet confirmed"
+        );
+        app.pending_remote_volume = None;
+        assert_eq!(app.now_playing().unwrap().volume_percent, 60);
+
+        // A poll sent after the push read the newer volume.
+        app.remote_poll_seq += 1;
+        let mut state = app.remote.as_ref().unwrap().state.clone();
+        state.device.as_mut().unwrap().volume_percent = Some(45);
+        app.handle_api(ApiResponse::PlaybackState {
+            seq: app.remote_poll_seq,
+            result: Ok(Some(state)),
+        });
+        assert_eq!(app.now_playing().unwrap().volume_percent, 45);
+
+        app.handle_remote_volume("sonos", percent_to_volume(60));
+        let mut state = app.remote.as_ref().unwrap().state.clone();
+        let device = state.device.as_mut().unwrap();
+        device.id = Some("phone".into());
+        device.volume_percent = Some(40);
+        app.handle_api(ApiResponse::PlaybackState {
+            seq: app.remote_poll_seq,
+            result: Ok(Some(state)),
+        });
+        assert!(app.pushed_remote_volume.is_none());
+        assert_eq!(app.now_playing().unwrap().volume_percent, 40);
+        let device = app.remote.as_mut().unwrap().state.device.as_mut().unwrap();
+        device.volume_percent = Some(40);
+        app.handle_remote_volume("sonos", percent_to_volume(70));
+        assert_eq!(
+            app.now_playing().unwrap().volume_percent,
+            40,
+            "a push about another device than the one shown"
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn the_playing_song_keeps_its_album_and_art_without_cached_details() {
+        let mut app = headless_app();
+        crate::demo::populate(&mut app);
+        app.local_ready = false;
+        app.frame_now = None;
+        app.track_cache.clear();
+
+        let now = app.now_playing().unwrap();
+        assert!(!now.album_name.is_empty());
+        assert!(now.art_small.is_some());
+        let Some(PlayableItem::Track(track)) = app.now_playing_item() else {
+            panic!("the demo plays a song");
+        };
+        let album = track.album.as_ref().expect("the album goes along");
+        assert_eq!(album.name, now.album_name);
+        assert_eq!(Some(&album.id), now.album_id.as_ref());
+        assert_eq!(track.image(64), now.art_small.as_deref());
+        assert_eq!(track.image(640), now.art_url.as_deref());
         app.backend.shutdown();
     }
 
@@ -30097,6 +31477,110 @@ mod tests {
             first.uri,
             "the preview stays while the play request is pending"
         );
+    }
+
+    #[test]
+    fn shuffled_header_play_of_a_shown_view_starts_at_a_random_row() {
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        app.shuffle_wanted = true;
+        let ctx = egui::Context::default();
+        let uris: Arc<[String]> = (0..20)
+            .map(|n| format!("spotify:track:t{n}"))
+            .collect::<Vec<_>>()
+            .into();
+        let view = || RowContext::View {
+            context_uri: "spotify:playlist:mix".into(),
+            uris: Arc::clone(&uris),
+            editable_playlist: None,
+        };
+        let mut starts = HashSet::new();
+        for _ in 0..30 {
+            app.apply(
+                Action::PlayFromRow {
+                    context: view(),
+                    uri: String::new(),
+                    index: 0,
+                },
+                &ctx,
+            );
+            let play = app.queued_play.as_ref().unwrap();
+            assert_eq!(play.uris.as_slice(), uris.as_ref());
+            let start = play.offset_position.unwrap();
+            assert_eq!(
+                app.current_track_uri(),
+                Some(uris[start as usize].clone()),
+                "the chosen song shows as playing at once"
+            );
+            starts.insert(start);
+        }
+        assert!(
+            starts.len() > 1,
+            "the header's Play must not always start at the top row: {starts:?}"
+        );
+
+        app.apply(
+            Action::PlayFromRow {
+                context: view(),
+                uri: uris[0].clone(),
+                index: 0,
+            },
+            &ctx,
+        );
+        assert_eq!(
+            app.queued_play.as_ref().unwrap().offset_position,
+            Some(0),
+            "a clicked row still plays first with shuffle on"
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn shuffled_header_play_of_a_long_view_hands_over_a_full_list() {
+        let uris: Vec<String> = (0..600).map(|n| format!("spotify:track:t{n}")).collect();
+        let (window, index) = cap_uris_around(&uris, 590);
+        assert_eq!(
+            window.len(),
+            MAX_PLAYED_URIS,
+            "a late start keeps 500 songs"
+        );
+        assert_eq!(window[index as usize], uris[590]);
+        assert_eq!(
+            window.first(),
+            Some(&uris[100]),
+            "the window ends at the last song"
+        );
+        let (window, index) = cap_uris_around(&uris, 3);
+        assert_eq!(
+            (window.len(), window.first(), index),
+            (MAX_PLAYED_URIS, Some(&uris[3]), 0)
+        );
+        let (window, index) = cap_uris_around(&uris[..20], 7);
+        assert_eq!((window.len(), index), (20, 7), "a short list is kept whole");
+
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        app.shuffle_wanted = true;
+        let ctx = egui::Context::default();
+        let uris: Arc<[String]> = uris.into();
+        for _ in 0..20 {
+            app.apply(
+                Action::PlayFromRow {
+                    context: RowContext::View {
+                        context_uri: "spotify:playlist:mix".into(),
+                        uris: Arc::clone(&uris),
+                        editable_playlist: None,
+                    },
+                    uri: String::new(),
+                    index: 0,
+                },
+                &ctx,
+            );
+            let play = app.queued_play.as_ref().unwrap();
+            assert_eq!(play.uris.len(), MAX_PLAYED_URIS);
+            assert!(play.offset_position.unwrap() < MAX_PLAYED_URIS as u32);
+        }
+        app.backend.shutdown();
     }
 
     #[test]
@@ -31705,11 +33189,14 @@ mod tests {
         let mut app = headless_app();
         app.settings.winamp_window = true;
         app.settings.skin = Some("B.wsz".into());
-        app.skin_loaded(crate::winamp::Loaded {
-            name: "A.wsz".into(),
-            result: Ok(some_skin("A")),
-            installed: false,
-        });
+        app.skin_loaded(
+            crate::winamp::Loaded {
+                name: "A.wsz".into(),
+                result: Ok(some_skin("A")),
+                installed: false,
+            },
+            &egui::Context::default(),
+        );
         assert_eq!(app.winamp.worn.as_deref(), Some("A.wsz"));
         assert_eq!(app.settings.skin.as_deref(), Some("B.wsz"));
     }
@@ -31718,11 +33205,14 @@ mod tests {
     fn a_dropped_skin_becomes_the_choice_and_a_failed_one_is_forgotten() {
         let mut app = headless_app();
         app.settings.winamp_window = true;
-        app.skin_loaded(crate::winamp::Loaded {
-            name: "Dropped.wsz".into(),
-            result: Ok(some_skin("Dropped")),
-            installed: true,
-        });
+        app.skin_loaded(
+            crate::winamp::Loaded {
+                name: "Dropped.wsz".into(),
+                result: Ok(some_skin("Dropped")),
+                installed: true,
+            },
+            &egui::Context::default(),
+        );
         assert_eq!(app.settings.skin.as_deref(), Some("Dropped.wsz"));
         assert_eq!(app.winamp.worn.as_deref(), Some("Dropped.wsz"));
         assert!(
@@ -31732,11 +33222,14 @@ mod tests {
         );
 
         app.settings.skin = Some("Gone.wsz".into());
-        app.skin_loaded(crate::winamp::Loaded {
-            name: "Gone.wsz".into(),
-            result: Err(crate::skin::SkinError::Empty),
-            installed: false,
-        });
+        app.skin_loaded(
+            crate::winamp::Loaded {
+                name: "Gone.wsz".into(),
+                result: Err(crate::skin::SkinError::Empty),
+                installed: false,
+            },
+            &egui::Context::default(),
+        );
         assert_eq!(app.settings.skin.as_deref(), Some("Dropped.wsz"));
         assert_eq!(app.winamp.worn.as_deref(), Some("Dropped.wsz"));
         assert!(

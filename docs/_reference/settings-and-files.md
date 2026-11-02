@@ -13,7 +13,7 @@ Spotifast follows each platform's conventions. On Linux:
 | What | Where | Safe to delete? |
 | --- | --- | --- |
 | Settings | `~/.config/spotifast/settings.json` | Yes, you lose preferences |
-| Winamp skins | `~/.config/spotifast/skins/` | Yes, you add them again |
+| Winamp and Windows Media Player skins | `~/.config/spotifast/skins/` | Yes, you add them again |
 | MilkDrop presets | `~/.config/spotifast/milkdrop/` | Yes, you fetch them again |
 | Spotify grants (available since 0.8.0) | System credential store | Use Sign out in Settings |
 | Credential revocation markers (available since 0.8.0) | `~/.local/state/spotifast/credential-storage/` | Keep after a failed sign-out deletion |
@@ -45,6 +45,31 @@ where each system keeps it, not in `settings.json`:
 
 Deleting the entry turns it off. Uninstalling Spotifast does not remove the
 Linux or Windows entry; choose **Off** first.
+
+Settings > Storage shows the current file sizes of the artwork cache, audio
+cache and local play history beside their names, in decimal units (1 MB is
+1,000,000 bytes). Sizes are checked in the background while this section is
+visible and refreshed about every five seconds, including after clearing.
+Missing files show 0 B; metadata or directory-traversal errors show Unavailable.
+File contents are not read to measure usage, so a file without read permission
+can still have a size when its metadata is accessible. Artwork counts the files
+its Clear artwork button removes; audio includes nested cache folders.
+Symbolic links are skipped. These are file sizes, so filesystem allocation,
+compression and files still open during playback can affect the disk space
+actually freed. Clear history saves an empty history file rather than deleting
+the file. Sign-in credentials are managed by the system and have no file-size
+estimate here.
+
+**Clear audio** removes cached audio in the background, including when signed
+out or audio caching is disabled. It keeps the cache folder, sign-in, volume,
+history and playback settings. The button shows Clearing while it works and
+the size refreshes when it finishes, including after an error. During an engine
+reconnection, retry once playback is ready. An active cache removes files
+through librespot so its size accounting stays correct; unrecognized files are
+left in place, the rest is still cleared, and a message says how many stayed.
+Playback keeps responding during a clear, and a connection that starts during
+one waits for it to finish. Files still open for playback may keep disk space
+until closed, and ongoing playback can populate the cache again.
 
 Clearing caches never signs you out. Sign-out from Settings covers the shared
 and personal Web API grants and the independent playback credential. It also
@@ -273,7 +298,8 @@ On macOS, settings, state, and the logs are in
 `~/Library/Caches/me.paolino.spotifast`. On Windows, settings are in
 `%APPDATA%\paolino\spotifast\config`, state and the logs in
 `%LOCALAPPDATA%\paolino\spotifast\data`, and the caches in
-`%LOCALAPPDATA%\paolino\spotifast\cache`.
+`%LOCALAPPDATA%\paolino\spotifast\cache`. The main window's size and
+interface memory are in `app.ron`, in `%APPDATA%\spotifast\data` on Windows.
 
 ### Portable copies
 
@@ -285,7 +311,7 @@ it.
 | What | Where |
 | --- | --- |
 | Settings, skins, MilkDrop presets, themes | `spotifast-data\config\` |
-| State, history, logs, credential markers and the encrypted grant copies | `spotifast-data\state\` |
+| State, history, logs, `app.ron`, credential markers and the encrypted grant copies | `spotifast-data\state\` |
 | Caches | `spotifast-data\cache\` |
 
 The first time it starts without that folder, it copies (never moves) your
@@ -295,6 +321,11 @@ again. The installed Spotifast keeps its own files, and from then on the two
 never share settings, history or caches. The copy is made in
 `spotifast-data.partial` and renamed when complete, so a copy interrupted by
 a crash or power cut is made again at the next start.
+
+`app.ron` is in that folder too. A portable copy that has none
+yet starts from a copy of `%APPDATA%\spotifast\data\app.ron`, so the window
+opens as you left it. That file stays where it is, because the installed
+Spotifast uses it; without an installed copy you can delete it.
 
 If Spotifast cannot write next to its executable, for example in
 `Program Files` or on read-only media, it uses the folders above and says why
@@ -326,7 +357,9 @@ directory), a `spotifast` folder in your private temporary directory
 Windows. A portable copy has its own, `instance\scope-portable-<id>` in the
 installed state directory, with one `<id>` per portable folder, so it runs
 beside the installed copy and other portable copies instead of handing your
-launches to them. `instance.lock` marks the running copy; the system releases it when
+launches to them. This is the one thing a portable copy keeps outside its
+folder, because the folder may sit on a drive other users can read. It holds
+nothing of yours. `instance.lock` marks the running copy; the system releases it when
 Spotifast quits or crashes. `instance.sock` (Linux and macOS) is the socket
 a second launch and the `spotifast` command reach it through, which only your
 user can open. On Windows, `instance.key` holds the loopback port and a
@@ -387,7 +420,7 @@ main fields are:
 | `playlist_shaded` | `false` | The playlist window is rolled up to its title bar |
 | `winamp_shaded` | `false` | The main window is rolled up to its title bar |
 | `milkdrop_open` | `false` | The MilkDrop window is open |
-| `milkdrop_seconds` | `30` | How long each MilkDrop preset plays |
+| `milkdrop_seconds` | `10` | How long each MilkDrop preset plays, never less than its 2.7-second fade. A new value applies to the preset playing |
 | `milkdrop_fps` | `60` | MilkDrop frame rate; `0` is uncapped. At most 30 while the system saves energy |
 | `milkdrop_screen_hz` | `0` | Last refresh rate reported by MilkDrop's window |
 | `milkdrop_fullscreen` | `false` | The MilkDrop window fills the screen |
