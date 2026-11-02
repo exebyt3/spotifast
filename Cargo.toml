@@ -377,10 +377,10 @@ hyper-proxy2 = { git = "https://github.com/crmne/hyper-proxy2", rev = "efca48113
 # librespot-org's #1795, so a song picked in a phone's playlist plays instead
 # of the playlist's first (the app sends an empty track_uri next to the uid).
 # Go back to crmne/librespot once its spotifast-dev carries it.
-librespot-audio = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
-librespot-connect = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
-librespot-core = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
-librespot-metadata = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
-librespot-oauth = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
-librespot-playback = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
-librespot-protocol = { git = "https://github.com/exebyt3/librespot", rev = "612da43f0ae47171691b5df2441bdcc5757662de" }
+librespot-audio = { git = "https://github.com/exebyt3/librespot", rev = "e7279cdedd22ea59f1613f3946248bacb850070c" }
+librespot-connect = { git = "https://github.com/exebyt3/librespot", rev = "e7279cdedd22ea59f1613f3946248bacb850070c" }
+librespot-core = { git = "https://github.com/exebyt3/librespot", rev = "e7279cdedd22ea59f1613f3946248bacb850070c" }
+librespot-metadata = { git = "https://github.com/exebyt3/librespot", rev = "e7279cdedd22ea59f1613f3946248bacb850070c" }
+librespot-oauth = { git = "https://github.com/exebyt3/librespot", rev = "e7279cdedd22ea59f1613f3946248bacb850070c" }
+librespot-playback = { git = "https://github.com/exebyt3/librespot", rev = "e7279cdedd22ea59f1613f3946248bacb850070c" }
+librespot-protocol = { git = "https://github.com/exebyt3/librespot", rev = "e7279cdedd22ea59f1613f3946248bacb850070c" }
