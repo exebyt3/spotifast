@@ -59,10 +59,11 @@ Windows visuals keep their level as Soloist’s volume falls and stop only when 
 When enabled, Soloist appears as **This computer**; settings show the controls
 that apply to it. Turning it off restores the built-in player's preferences.
 While Soloist starts and its account is verified, the Spotify loading screen shows
-**Verifying Soloist…** and waits to accept playback commands. **Set up Soloist**
-opens setup if pairing needs attention. After downloading, the wizard focuses on
-choosing the named device in Spotify, with the built-in player available as a
-quiet alternative below the card. **Settings → Account → Spotify access**
+**Verifying Soloist…** and waits to accept playback commands. Setup takes three
+steps, and ends with choosing the named device in Spotify, with the built-in
+player available as a quiet alternative below the card. If Soloist stops later,
+a banner over the app says so while Spotifast restarts it, and offers **Try
+again** if that does not work. **Settings → Spotify Soloist → Spotify access**
 connects the separate Spotify session for Made for you, listening activity and
 Spotify lyrics without changing players.
 
@@ -92,13 +93,15 @@ Spotify lyrics without changing players.
 
 ## Start listening
 
-1. Make your own free Spotify app, as the sign-in screen shows: in the
+1. Register Spotifast with Spotify, as the sign-in screen shows: in the
    [Spotify developer dashboard](https://developer.spotify.com/dashboard),
-   create an app with the redirect URI `http://127.0.0.1:8989/login` and
-   **Web API** ticked. Spotify requires Premium on the account that creates
-   it. [Getting started](https://spotifast.rocks/getting-started/#make-a-spotify-app)
+   click **Create app**, Spotify's name for this registration, with the
+   redirect URI `http://127.0.0.1:8989/login` and **Web API** ticked. It takes
+   about two minutes and gives you a Client ID. Spotify requires Premium on the
+   account that registers, so a Free account can't do this step itself.
+   [Getting started](https://spotifast.rocks/getting-started/#make-a-spotify-app)
    has the steps.
-2. Paste its Client ID into Spotifast and choose **Sign in with Spotify**.
+2. Paste the Client ID into Spotifast and choose **Sign in with Spotify**.
    Approve access in your browser, then return to the app to see your library.
 3. To listen on this computer, open the device menu in the bottom player bar
    and choose **Set up playback here**, also available in Settings.
@@ -150,7 +153,7 @@ The complete guide lives at **[spotifast.rocks](https://spotifast.rocks/)**.
 | Fix "Spotify refused the audio key" or "Spotify is being slow" | [When something goes wrong](https://spotifast.rocks/troubleshooting/) |
 | Understand what is stored and sent | [Privacy](https://spotifast.rocks/privacy/) · [How it connects](https://spotifast.rocks/how-it-connects/) |
 | Check Spotify and librespot limitations | [What Spotify allows](https://spotifast.rocks/what-spotify-allows/) |
-| Understand account risk | [Will my account get banned?](https://spotifast.rocks/what-is-spotifast/#will-my-spotify-account-get-banned) |
+| Is it safe for my account? | [Account safety](https://spotifast.rocks/what-is-spotifast/#account-safety) |
 | Report a bug or propose a feature | Read [Contributing](CONTRIBUTING.md), then use the [issue forms](https://github.com/crmne/spotifast/issues/new/choose). |
 
 ## Contributing

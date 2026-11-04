@@ -27,6 +27,7 @@ Spotifast follows each platform's conventions. On Linux:
 | Audio cache | `~/.cache/spotifast/audio/` | Always |
 | Artwork cache | `~/.cache/spotifast/art/` | Always |
 | Lyrics cache | `~/.cache/spotifast/lyrics/` | Always |
+| Skin previews | `~/.cache/spotifast/skin-previews/` | Always, they are drawn again |
 | Account-scoped playlist page cache | `~/.cache/spotifast/playlists/<account-id>/` | Always |
 | Account-scoped playlist list | `~/.cache/spotifast/library/` | Always |
 | Account-scoped Home shelves | `~/.cache/spotifast/home/` | Always |
@@ -126,7 +127,7 @@ filesystem failure is reported. Revocation markers prevent a failed protected
 entry deletion from restoring the session on restart; keep these markers when
 a deletion failed. Changing the personal Client ID clears that app's old
 grant. Signing out keeps the Client ID, so the next sign-in needs no setup.
-Since 0.14.2 Settings no longer removes the personal app: it is what the
+Since 0.14.2 Settings no longer removes the Client ID: it is what the
 session signs in with. A shared grant saved by an earlier version is kept
 under its own entry with the Client ID it was issued to.
 
@@ -403,7 +404,7 @@ main fields are:
 | `winamp_window` | `false` | The window is the Winamp mini player |
 | `winamp_show_taskbar` | `true` | Windows since 0.8.0, and Linux X11 sessions: show the Winamp window's taskbar button; the main window always keeps its button. Wayland and macOS ignore it |
 | `custom_titlebar` | `false` | Windows and Linux: draw Spotifast's own title bar and window buttons instead of the desktop's |
-| `skin` | none | File or folder name in the skins folder; blank uses the built-in skin |
+| `skin` | `Spotifast Wide` | File or folder name in the skins folder, or `Spotifast Tall` or `Spotifast Wide`; blank uses the built-in Winamp skin |
 | `random_skin` | `false` | Since 0.11.0: pick a different skin (built-in or installed) each time the mini player opens; `skin` holds the one picked |
 | `skin_scale` | by display | Screen pixels per skin pixel, 1 to 4 |
 | `winamp_on_top` | `false` | Keep the mini player above other windows |
@@ -424,13 +425,15 @@ main fields are:
 | `milkdrop_fps` | `60` | MilkDrop frame rate; `0` is uncapped. At most 30 while the system saves energy |
 | `milkdrop_screen_hz` | `0` | Last refresh rate reported by MilkDrop's window |
 | `milkdrop_fullscreen` | `false` | The MilkDrop window fills the screen |
+| `milkdrop_panel_height` | `232` | The MilkDrop panel's height in the mini player, in skin pixels |
+| `lyrics_milkdrop` | `false` | MilkDrop rather than the cover's art behind full screen lyrics |
 | `milkdrop_size` | `640, 480` | The MilkDrop window's size in points |
 | `keep_playing_in_background` | `true` | Close to tray |
 | `tray_icon` | `colour` | Linux and Windows: the tray icon in `colour`, or in `white` or `black` to match the panel or taskbar. macOS ignores it: the menu bar draws its icon black or white to match itself |
 | `mac_notch_widget` | `false` | Show interactive Now Playing widget when hovering over the MacBook notch (macOS only) |
 | `mac_show_in_dock` | `true` | macOS only: show Spotifast in the Dock and Cmd+Tab. `false` keeps it in the menu bar only; the menu-bar icon always stays |
 | `check_for_updates` | `true` | Ask GitHub once a day for a newer release |
-| `web_client_id` | none | Client ID of your own Spotify app, which Spotifast signs in with |
+| `web_client_id` | none | The Client ID you got by registering Spotifast, which it signs in with |
 | `personal_app_nudge_at` | none | Legacy daily-reminder timestamp, retained for older releases |
 | `personal_app_intro_seen` | `false` | Whether the Premium personal-app introduction was dismissed or followed (available since 0.8.0) |
 | `slow_app_banner` | none | When the "Spotify is being slow" banner last appeared (`shown_at`) and how many times it was closed (`dismissals`; at 3 it stops). Kept by the app, not a preference |
@@ -483,20 +486,20 @@ and `--demo-show` adds surfaces on top of it: a comma separated list of
 a normal, narrow, or wide sidebar and collapsed artwork for matching captures.
 `shuffle-selected` and `shuffle-started` capture the selected-mode and
 playback-started outcomes of a collection Shuffle click. `update` shows a sample
-update badge for checking its layout. `personal-app` shows the personal Spotify
-app introduction for a listener on a shared grant, and `slow-banner` the
-banner suggesting one when Spotify slows the shared app down. `audio-key-banner` shows the banner for a song
+update badge for checking its layout. `personal-app` shows the introduction to
+registering Spotifast for a listener on a shared grant, and `slow-banner` the
+banner suggesting it when Spotify slows the shared sign-in down. `audio-key-banner` shows the banner for a song
 whose audio key Spotify refused. `audio-outputs` opens the device picker with sample audio
 outputs to choose from, as Spotifast's own output lists them.
 `signed-out` and `connecting` show the sign-in card, with the steps for
-setting up a Spotify app, before and while the session connects;
+registering Spotifast, before and while the session connects;
 `waiting-for-browser` shows it while the browser is open.
 `sign-in-returning` shows it for a listener with a Client ID saved,
 `sign-in-malformed` with one that cannot be a Client ID, and
 `sign-in-shared-retired`, `sign-in-unknown-client` and `sign-in-not-allowed`
 after each way Spotify can turn a sign-in down. `shared-grant` shows
 Settings for a listener still on a shared grant from before 0.14.2, and
-`own-app` for one using their own app.
+`own-app` for one using their own Client ID.
 `system-light` and `system-dark` choose Follow system on a desktop that is
 light or dark (on Linux), to show the light and dark mode themes; with an
 explicit `--demo-data` directory, its `config/settings.json` and

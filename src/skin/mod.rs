@@ -8,7 +8,10 @@
 
 pub mod config;
 pub mod font;
+pub mod generic;
 pub mod layout;
+pub mod preview;
+pub mod script;
 pub mod sprites;
 pub mod wmp;
 pub mod zip;
@@ -108,7 +111,7 @@ pub struct Skin {
     pub regions: Regions,
     /// Set when this is a Windows Media Player skin: the mini player then
     /// draws it instead of the Winamp windows.
-    pub wmp: Option<wmp::Wmp>,
+    pub wmp: Option<Arc<wmp::Wmp>>,
 }
 
 impl Skin {
@@ -128,7 +131,7 @@ impl Skin {
     /// Reads a `.wsz` archive. File names are matched without regard to
     /// case or folder, and when a name repeats the last copy wins, which
     /// is what unpacking onto Winamp's file system produced. A `.wmz`
-    /// (a zip with a `.wms` definition and no `main.bmp`) is a Windows
+    /// (a zip with a `.wms` definition and not Winamp's sheets) is a Windows
     /// Media Player skin.
     pub fn from_archive(name: impl Into<String>, bytes: &[u8]) -> Result<Self, SkinError> {
         let name = name.into();
@@ -215,24 +218,31 @@ impl Skin {
     /// A Windows Media Player skin: the built-in Winamp sheets stand behind
     /// it, unused, so that every `Skin` can answer for every sheet.
     fn from_media_player(name: String, files: Files) -> Result<Self, SkinError> {
+        let files = Arc::new(files);
         let mut definitions: Vec<&String> =
             files.keys().filter(|file| file.ends_with(".wms")).collect();
         definitions.sort();
         let wmp = definitions
             .into_iter()
             .find_map(|file| {
-                let bytes = &files[file];
-                let text = decode_definition(bytes);
-                wmp::Wmp::parse(&text, &files)
+                let text = decode_definition(&files[file]);
+                let stem = file.strip_suffix(".wms").unwrap_or(file);
+                wmp::Wmp::parse(&text, stem, files.clone())
             })
             .ok_or(SkinError::NoView)?;
+        // The bars a pane falls back to can wear the skin's colours.
+        let vis_colors = files
+            .get("viscolor.txt")
+            .map_or(config::DEFAULT_VIS_COLORS, |bytes| {
+                config::parse_vis_colors(&String::from_utf8_lossy(bytes))
+            });
         Ok(Self {
             name,
             sheets: HashMap::new(),
             playlist: PlaylistStyle::default(),
-            vis_colors: config::DEFAULT_VIS_COLORS,
+            vis_colors,
             regions: Regions::default(),
-            wmp: Some(wmp),
+            wmp: Some(Arc::new(wmp)),
         })
     }
 
@@ -295,6 +305,25 @@ impl Skin {
         BUILTIN.clone()
     }
 
+    /// The Windows Media Player skin Spotifast ships, read as any other is.
+    pub fn ribbon() -> Result<Skin, SkinError> {
+        Skin::from_archive(RIBBON, RIBBON_ARCHIVE)
+    }
+
+    /// The wide sibling of [`Skin::ribbon`].
+    pub fn wide() -> Result<Skin, SkinError> {
+        Skin::from_archive(WIDE, WIDE_ARCHIVE)
+    }
+
+    /// A Windows Media Player skin the app ships, by its name.
+    pub fn shipped(name: &str) -> Option<Result<Skin, SkinError>> {
+        match name {
+            RIBBON => Some(Skin::ribbon()),
+            WIDE => Some(Skin::wide()),
+            _ => None,
+        }
+    }
+
     /// Whether the skin brought this sheet itself.
     pub fn has(&self, sheet: Sheet) -> bool {
         self.sheets.contains_key(&sheet)
@@ -341,15 +370,26 @@ impl Skin {
 /// and no Winamp main window.
 pub(crate) fn is_media_player_skin<'a>(mut names: impl Iterator<Item = &'a str> + Clone) -> bool {
     names.clone().any(|name| name.ends_with(".wms"))
-        && !names.any(|name| matches!(name, "main.bmp" | "main.png"))
+        && !(names
+            .clone()
+            .any(|name| matches!(name, "main.bmp" | "main.png"))
+            && names.any(|name| {
+                matches!(
+                    name,
+                    "cbuttons.bmp" | "cbuttons.png" | "titlebar.bmp" | "titlebar.png"
+                )
+            }))
 }
 
 /// Whether a file inside a Windows Media Player skin is read: the
 /// definition and the pictures it can name.
 fn wanted_by_media_player(file_name: &str) -> bool {
     file_name.rsplit_once('.').is_some_and(|(_, extension)| {
-        matches!(extension, "wms" | "bmp" | "png" | "gif" | "jpg" | "jpeg")
-    })
+        matches!(
+            extension,
+            "wms" | "js" | "bmp" | "png" | "gif" | "jpg" | "jpeg"
+        )
+    }) || file_name == "viscolor.txt"
 }
 
 /// A definition as text: UTF-8, or UTF-16 with a byte order mark, which
@@ -401,7 +441,18 @@ fn wanted(file_name: &str) -> bool {
 }
 
 /// The built-in skin, drawn by `examples/default_skin.rs`.
+/// The name the settings hold for [`Skin::ribbon`], which is no file in the
+/// skins folder.
+pub const RIBBON: &str = "Spotifast Tall";
+/// The same, for [`Skin::wide`].
+pub const WIDE: &str = "Spotifast Wide";
+/// The skins the app ships, in the order they are listed.
+pub const SHIPPED: [&str; 2] = [RIBBON, WIDE];
+
 const BUILTIN_ARCHIVE: &[u8] = include_bytes!("../../assets/skins/spotifast.wsz");
+/// Cut and packed by `examples/ribbon_skin.rs`.
+const RIBBON_ARCHIVE: &[u8] = include_bytes!("../../assets/skins/spotifast-ribbon.wmz");
+const WIDE_ARCHIVE: &[u8] = include_bytes!("../../assets/skins/spotifast-wide.wmz");
 
 static BUILTIN: LazyLock<Arc<Skin>> = LazyLock::new(|| {
     Arc::new(Skin::from_archive("Spotifast", BUILTIN_ARCHIVE).expect("the built-in skin reads"))
@@ -524,6 +575,35 @@ mod tests {
         let sheet = skin.sheet(Sheet::CButtons);
         assert_eq!((sheet.width, sheet.height), (136, 36));
         assert_eq!(sheet.pixel(135, 35), Some([4, 5, 6, 255]));
+    }
+
+    /// Winamp's generic frame comes with the built-in skin, whole, so a
+    /// skin without a `gen.bmp` still frames MilkDrop.
+    #[test]
+    fn a_media_player_skin_can_bring_its_own_bar_colours() {
+        let definition = b"<THEME><VIEW id=\"main\" width=\"9\" height=\"9\"/></THEME>";
+        let colours = "1,2,3\n".repeat(24);
+        let archive = zip::write(&[
+            ("a.wms", definition.as_slice(), true),
+            ("viscolor.txt", colours.as_bytes(), true),
+        ]);
+        let skin = Skin::from_archive("a", &archive).unwrap();
+        assert_eq!(skin.vis_colors[5], [1, 2, 3]);
+        let archive = zip::write(&[("a.wms", definition.as_slice(), true)]);
+        let skin = Skin::from_archive("a", &archive).unwrap();
+        assert_eq!(skin.vis_colors, config::DEFAULT_VIS_COLORS);
+    }
+
+    #[test]
+    fn the_built_in_skin_has_the_generic_frame() {
+        let skin = Skin::builtin();
+        let bitmap = skin.sheet(Sheet::Gen);
+        assert!(bitmap.width >= 178 && bitmap.height >= 103);
+        for focused in [true, false] {
+            let letters = generic::letters(bitmap, focused);
+            assert!(letters.iter().all(|letter| letter.width > 0));
+        }
+        assert!(generic::window_background(skin.sheet(Sheet::GenEx)).is_some());
     }
 
     #[test]
@@ -682,7 +762,7 @@ mod tests {
         let skin = Skin::from_archive("Chrome", &archive).unwrap();
         let wmp = skin.wmp.as_ref().expect("a Windows Media Player skin");
         assert_eq!((wmp.width, wmp.height), (120, 60));
-        assert_eq!(wmp.buttons.len(), 1);
+        assert_eq!(wmp.views.len(), 1);
         // The Winamp sheets still answer, from the built-in skin.
         assert_eq!(skin.sheet(Sheet::Main), Skin::builtin().sheet(Sheet::Main));
         assert!(Skin::builtin().wmp.is_none());
@@ -704,6 +784,19 @@ mod tests {
         // A Winamp main window wins over a stray definition.
         let both = zip::write(&[
             ("main.bmp", &png(275, 116, [1, 1, 1]), false),
+            ("titlebar.bmp", &png(344, 87, [1, 1, 1]), false),
+            ("old.wms", definition, false),
+        ]);
+        assert!(Skin::from_archive("both", &both).unwrap().wmp.is_none());
+        // A player skin may well have a picture called main.bmp.
+        let named = zip::write(&[
+            ("main.bmp", &png(120, 60, [1, 1, 1]), false),
+            ("skin.wms", definition, false),
+        ]);
+        assert!(Skin::from_archive("named", &named).unwrap().wmp.is_some());
+        let both = zip::write(&[
+            ("main.bmp", &png(275, 116, [1, 1, 1]), false),
+            ("cbuttons.bmp", &png(136, 36, [1, 1, 1]), false),
             ("old.wms", definition, false),
         ]);
         assert!(Skin::from_archive("both", &both).unwrap().wmp.is_none());

@@ -2243,6 +2243,13 @@ impl Worker {
                             crate::soloist::Status::Off,
                         )));
                     }
+                    // A rate-limited sign-in can still be unverified here.
+                    // Saying so beats a button that seems to do nothing (#1137).
+                    if enabled && self.api.account().is_none() {
+                        self.emit(Event::Soloist(crate::soloist::Update::Status(
+                            crate::soloist::Status::Failed(crate::soloist::Failure::NotSignedIn),
+                        )));
+                    }
                     if enabled && let Some(account) = self.api.account() {
                         let commands = self.commands.clone();
                         let generation = self.soloist_generation;
@@ -3107,9 +3114,9 @@ impl Worker {
                         // in Settings while a shared grant keeps the app
                         // signed in (#634).
                         let message = if source == ApiSource::Shared {
-                            "Spotify permissions changed. Sign in with your own Spotify app."
+                            "Spotify permissions changed. Sign in with your Client ID."
                         } else {
-                            "Spotify permissions changed for your personal app. Authorize it \
+                            "Spotify permissions changed for your Client ID. Authorize it \
                              again, with Sign in or in Settings, under Account."
                         };
                         self.emit(Event::Error(message.into()));
@@ -3236,7 +3243,7 @@ impl Worker {
         }
         let message = match source {
             ApiSource::Shared => format!("Shared Spotify sign-in failed: {error}"),
-            ApiSource::Personal => format!("Personal app authorization failed: {error}"),
+            ApiSource::Personal => format!("Client ID authorization failed: {error}"),
         };
         let other_ready = match source {
             ApiSource::Shared => self.api.personal_ready(),
@@ -3459,8 +3466,8 @@ impl Worker {
                         Event::Auth(AuthStatus::Refused(SignInProblem::UnknownClient))
                     } else {
                         Event::Error(
-                            "Spotify doesn't know this Client ID. Copy it again from your \
-                             app's page in Spotify's developer dashboard."
+                            "Spotify doesn't know this Client ID. Copy it again from \
+                             Spotify's developer dashboard."
                                 .into(),
                         )
                     });
@@ -7050,12 +7057,21 @@ async fn spotify_lyrics(
     cache_dir: &std::path::Path,
 ) -> Option<crate::lyrics::Lyrics> {
     let id = uri.strip_prefix("spotify:track:")?;
-    let path = cache_dir.join(format!("spotify-{id}.json"));
+    // Answers from before the request named the cover are kept only for what
+    // they found: nearly all their "none"s were the request's doing.
+    let path = cache_dir.join(format!("spotify-v2-{id}.json"));
+    let before = cache_dir.join(format!("spotify-{id}.json"));
     if let Some(cached) = crate::lyrics::cached(&path) {
         return cached;
     }
+    if let Some(Some(found)) = crate::lyrics::cached(&before) {
+        return Some(found);
+    }
+    let found_before = || {
+        crate::lyrics::previously_found(&path).or_else(|| crate::lyrics::previously_found(&before))
+    };
     let Some(engine) = engine else {
-        return crate::lyrics::previously_found(&path);
+        return found_before();
     };
     match engine.lyrics_json(uri).await {
         Ok(json) => {
@@ -7065,7 +7081,7 @@ async fn spotify_lyrics(
         }
         Err(error) => {
             log::debug!("spotify lyrics unavailable: {error:#}");
-            crate::lyrics::previously_found(&path)
+            found_before()
         }
     }
 }
@@ -9829,7 +9845,7 @@ mod authorization_tests {
             // listener's own app; a personal app is renewed by signing in
             // with it, or in Settings (#634).
             let advice = if slot == CredentialSlot::Shared {
-                "Sign in with your own Spotify app."
+                "Sign in with your Client ID."
             } else {
                 "with Sign in or in Settings, under Account."
             };
@@ -10851,6 +10867,46 @@ mod tests {
                 .await
                 .is_none()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Old "none"s stop counting, old finds keep working, and a new "none"
+    /// asks again after a week.
+    #[tokio::test]
+    async fn spotify_lyrics_answers_are_versioned_and_a_none_is_short_lived() {
+        let root = std::env::temp_dir().join(format!(
+            "spotifast-spotify-lyrics-v2-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let found = crate::lyrics::from_text("[00:01.00] A test line");
+
+        crate::lyrics::store(&root.join("spotify-kept.json"), &found);
+        assert_eq!(
+            spotify_lyrics(None, "spotify:track:kept", &root).await,
+            found
+        );
+
+        let old_none = root.join("spotify-gone.json");
+        crate::lyrics::store(&old_none, &None);
+        assert_eq!(crate::lyrics::cached(&old_none), Some(None), "as it was");
+        assert!(
+            spotify_lyrics(None, "spotify:track:gone", &root)
+                .await
+                .is_none()
+        );
+
+        let none = root.join("spotify-v2-none.json");
+        crate::lyrics::store(&none, &None);
+        assert_eq!(crate::lyrics::cached(&none), Some(None), "fresh");
+        let eight_days = std::time::SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 8);
+        std::fs::File::options()
+            .write(true)
+            .open(&none)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(eight_days))
+            .unwrap();
+        assert_eq!(crate::lyrics::cached(&none), None, "and gone in a week");
         std::fs::remove_dir_all(root).unwrap();
     }
 

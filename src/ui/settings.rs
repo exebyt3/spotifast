@@ -16,6 +16,9 @@ const PLAYBACK_DIRTY_ID: &str = "playback-settings-dirty";
 pub(crate) const PERSONAL_APP_FOCUS_ID: &str = "focus-personal-app-setup";
 const SETTINGS_FILTER_ID: &str = "settings-filter";
 
+use super::skin_cards::{self, Card};
+use crate::skin_previews::BUILT_IN;
+
 /// Whether a settings row matches the filter query (case-insensitive).
 /// An empty query matches everything, so the page reads exactly as
 /// before when the search field is empty.
@@ -29,14 +32,14 @@ pub(crate) fn row_matches(needle: &str, title: &str, description: &str) -> bool 
 
 /// Text shared by section selection and the rendered row. Conditional rows
 /// participate only on the platforms and account states where they exist.
-struct RowText<'a> {
+pub(super) struct RowText<'a> {
     title: std::borrow::Cow<'a, str>,
     description: std::borrow::Cow<'a, str>,
     available: bool,
 }
 
 impl<'a> RowText<'a> {
-    fn new(
+    pub(super) fn new(
         title: impl Into<std::borrow::Cow<'a, str>>,
         description: impl Into<std::borrow::Cow<'a, str>>,
     ) -> Self {
@@ -47,7 +50,7 @@ impl<'a> RowText<'a> {
         }
     }
 
-    fn when(mut self, available: bool) -> Self {
+    pub(super) fn when(mut self, available: bool) -> Self {
         self.available = available;
         self
     }
@@ -137,7 +140,7 @@ fn section_matches(needle: &str, title: &str, rows: &[RowText<'_>]) -> bool {
     rows.iter().any(|row| row.matches(&needle, title))
 }
 
-fn filtered_row(
+pub(super) fn filtered_row(
     ui: &mut egui::Ui,
     palette: &Palette,
     needle: &str,
@@ -147,6 +150,19 @@ fn filtered_row(
 ) {
     if row.matches(needle, section) {
         widgets::setting_row(ui, palette, &row.title, &row.description, control);
+    }
+}
+
+/// `filtered_row` for a row with no control.
+pub(super) fn filtered_note(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    needle: &str,
+    section: &str,
+    row: &RowText<'_>,
+) {
+    if row.matches(needle, section) {
+        widgets::setting_note(ui, palette, &row.title, &row.description);
     }
 }
 
@@ -453,6 +469,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         palette.text,
     );
     ui.add_space(4.0);
+    #[cfg(feature = "demo")]
+    if let Some(filter) = app.winamp.demo_settings_filter.take() {
+        ui.data_mut(|data| data.insert_temp(egui::Id::new(SETTINGS_FILTER_ID), filter));
+    }
     let mut filter = ui
         .data(|data| data.get_temp::<String>(egui::Id::new(SETTINGS_FILTER_ID)))
         .unwrap_or_default();
@@ -479,13 +499,23 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let mut changed = false;
     let mut any_visible = false;
     let soloist = gettext(locale, "Spotify Soloist");
-    if row_matches(
+    let soloist_rows = super::soloist::rows(app);
+    let soloist_keywords = row_matches(
         &needle,
         &soloist,
         &gettext(locale, "Playback lossless setup key download updates"),
-    ) {
+    );
+    if soloist_keywords || section_matches(&needle, &soloist, &soloist_rows) {
         any_visible = true;
-        section(ui, &palette, &soloist, |ui| super::soloist::show(app, ui));
+        // A word only the section knows shows it whole.
+        let rows_needle = if soloist_keywords {
+            ""
+        } else {
+            needle.as_str()
+        };
+        section(ui, &palette, &soloist, |ui| {
+            super::soloist::settings(app, ui, rows_needle, &soloist, &soloist_rows);
+        });
     }
 
     let open_folder = gettext(locale, "Open folder");
@@ -504,41 +534,44 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let sign_out = gettext(locale, "Sign out");
     let account_rows = [
         RowText::new(
-            gettext(locale, "Personal Spotify app"),
+            gettext(locale, "Spotify registration"),
             if app.shared_grant && !in_use {
                 gettext(
                     locale,
-                    "You're still signed in through the shared app Spotifast used before, which Spotify can stop accepting at any time. Set up your own app to keep listening.",
+                    "You're still on the shared sign-in Spotifast used before, which Spotify can stop accepting at any time. Register Spotifast to keep listening.",
                 )
             } else {
                 gettext(
                     locale,
-                    "Spotifast signs in through your own free Spotify app.",
+                    "Spotifast connects with the Client ID you registered with Spotify.",
                 )
             },
         ),
         RowText::new(
-            gettext(locale, "Create an app"),
+            gettext(locale, "Register Spotifast"),
             gettext(
                 locale,
-                "Create one for free in Spotify's developer dashboard.",
+                "It takes about two minutes in Spotify's developer dashboard.",
             ),
         )
         .when(!in_use),
         RowText::new(
-            gettext(locale, "Personal app ready"),
+            gettext(locale, "Spotifast registered"),
             if app.shared_grant {
                 gettext(
                     locale,
-                    "Supported requests use your app. Other requests use the shared app.",
+                    "Supported requests use your Client ID. Other requests use the shared sign-in.",
                 )
             } else {
-                gettext(locale, "Spotifast uses your app for Spotify's Web API.")
+                gettext(
+                    locale,
+                    "Spotifast uses your Client ID for Spotify's Web API.",
+                )
             },
         )
         .when(in_use),
         RowText::new(
-            gettext(locale, "Authorize your personal app"),
+            gettext(locale, "Authorize your Client ID"),
             gettext(
                 locale,
                 "Spotify opens in your browser to verify the account.",
@@ -546,14 +579,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         )
         .when(!in_use && wanted.is_some()),
         RowText::new(sign_out.clone(), account.clone()),
-        RowText::new(
-            gettext(locale, "Spotify access"),
-            gettext(
-                locale,
-                "Made for you, listening activity and Spotify lyrics.",
-            ),
-        )
-        .when(app.settings.soloist_enabled),
     ];
     if section_matches(&needle, &account, &account_rows) {
         any_visible = true;
@@ -673,9 +698,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     }
                 });
             }
-            filtered_row(ui, &palette, &needle, &account, &account_rows[5], |ui| {
-                spotify_access_control(app, ui);
-            });
         });
     }
 
@@ -1816,7 +1838,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 "{} {}",
                 gettext(
                     locale,
-                    "Windows Media Player .wmz skins. Drop one on either window to add it.",
+                    "Windows Media Player .wmz skins. Find more in the Internet Archive's collection.",
                 ),
                 names_of(SkinKind::WindowsMediaPlayer)
             ),
@@ -1845,6 +1867,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ),
         )
         .when(app.taskbar_setting_visible()),
+        RowText::new(
+            gettext(locale, "Skins folder"),
+            gettext(
+                locale,
+                "Winamp and Windows Media Player skins are both kept here.",
+            ),
+        ),
     ];
     if section_matches(&needle, &mini_player, &mini_rows) {
         any_visible = true;
@@ -1856,7 +1885,23 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     app.actions.push(Action::ToggleWinampWindow);
                 }
             });
+            filtered_row(ui, &palette, &needle, &mini_player, &mini_rows[7], |ui| {
+                if theme::soft_button(ui, &palette, Some(Icon::ExternalLink), &open_folder, false)
+                    .clicked()
+                {
+                    app.actions.push(Action::OpenSkinsFolder);
+                }
+            });
             let choices = app.winamp.choices.clone();
+            let generation = app.winamp.choices_generation();
+            let listed = app.winamp.choices_known();
+            app.winamp.previews.begin(
+                ui.ctx(),
+                &app.dirs.skin_preview_dir(),
+                &choices,
+                generation,
+                listed,
+            );
             let showing = app
                 .settings
                 .skin
@@ -1874,7 +1919,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
                         if theme::soft_button(
                             ui,
                             &palette,
@@ -1887,41 +1931,31 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             app.actions
                                 .push(Action::OpenUrl("https://skins.webamp.org/".into()));
                         }
-                        if theme::soft_button(
-                            ui,
-                            &palette,
-                            Some(Icon::ExternalLink),
-                            &open_folder,
-                            false,
-                        )
-                        .clicked()
-                        {
-                            app.actions.push(Action::OpenSkinsFolder);
-                        }
                     });
                     ui.add_space(6.0);
-                    let mut options: Vec<(usize, &str)> = vec![(0, "Spotifast")];
-                    options.extend(
-                        choices
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, choice)| choice.kind == SkinKind::Winamp)
-                            .map(|(index, choice)| (index + 1, choice.label())),
-                    );
-                    let current = showing
+                    let kept: Vec<usize> = (0..choices.len())
                         .filter(|index| choices[*index].kind == SkinKind::Winamp)
-                        .map_or(0, |index| index + 1);
+                        .collect();
+                    let mut cards = vec![Card {
+                        key: BUILT_IN,
+                        label: "Spotifast",
+                    }];
+                    cards.extend(kept.iter().map(|index| Card {
+                        key: &choices[*index].name,
+                        label: choices[*index].label(),
+                    }));
                     // With a Windows Media Player skin on, nothing here is.
-                    let current = if showing.is_some() && current == 0 {
-                        usize::MAX
-                    } else {
-                        current
+                    let current = match showing {
+                        None => Some(0),
+                        Some(index) => kept.iter().position(|kept| *kept == index).map(|at| at + 1),
                     };
-                    if let Some(picked) = widgets::chips(ui, &palette, &options, current) {
+                    let picked =
+                        skin_cards::grid(ui, &palette, &mut app.winamp.previews, &cards, current);
+                    if let Some(picked) = picked {
                         app.actions.push(Action::SetSkin(
                             picked
                                 .checked_sub(1)
-                                .map(|index| choices[index].name.clone()),
+                                .map(|at| choices[kept[at]].name.clone()),
                         ));
                     }
                 });
@@ -1933,17 +1967,32 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         &palette,
                         &gettext(
                             locale,
-                            "Windows Media Player .wmz skins. Drop one on either window to add it.",
+                            "Windows Media Player .wmz skins. Find more in the Internet Archive's collection.",
                         ),
                     );
-                    let options: Vec<(usize, &str)> = choices
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, choice)| choice.kind == SkinKind::WindowsMediaPlayer)
-                        .map(|(index, choice)| (index, choice.label()))
+                    ui.add_space(6.0);
+                    if theme::soft_button(
+                        ui,
+                        &palette,
+                        Some(Icon::Globe),
+                        &gettext(locale, "Windows Media Player Skins Collection"),
+                        false,
+                    )
+                    .clicked()
+                    {
+                        app.actions.push(Action::OpenUrl(
+                            "https://archive.org/details/windowsmediaplayerskinscollection".into(),
+                        ));
+                    }
+                    let kept: Vec<usize> = (0..choices.len())
+                        .filter(|index| choices[*index].kind == SkinKind::WindowsMediaPlayer)
                         .collect();
                     ui.add_space(6.0);
-                    if options.is_empty() {
+                    // What comes with the app is not an installed skin.
+                    if kept
+                        .iter()
+                        .all(|index| crate::skin::SHIPPED.contains(&choices[*index].name.as_str()))
+                    {
                         skin_note(
                             ui,
                             &palette,
@@ -1953,30 +2002,32 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             )
                             .replace("{folder}", &skins_folder.display().to_string()),
                         );
-                    } else {
-                        let current = showing
-                            .filter(|index| choices[*index].kind == SkinKind::WindowsMediaPlayer)
-                            .unwrap_or(usize::MAX);
-                        if let Some(picked) = widgets::chips(ui, &palette, &options, current) {
-                            app.actions
-                                .push(Action::SetSkin(Some(choices[picked].name.clone())));
-                        }
                     }
-                    if showing
-                        .is_some_and(|index| choices[index].kind == SkinKind::WindowsMediaPlayer)
-                    {
-                        ui.add_space(6.0);
-                        skin_note(
+                    if !kept.is_empty() {
+                        let cards: Vec<Card> = kept
+                            .iter()
+                            .map(|index| Card {
+                                key: &choices[*index].name,
+                                label: choices[*index].label(),
+                            })
+                            .collect();
+                        let current =
+                            showing.and_then(|index| kept.iter().position(|kept| *kept == index));
+                        let picked = skin_cards::grid(
                             ui,
                             &palette,
-                            &gettext(
-                                locale,
-                                "This skin has no equalizer or playlist window, and its scripts do not run.",
-                            ),
+                            &mut app.winamp.previews,
+                            &cards,
+                            current,
                         );
+                        if let Some(picked) = picked {
+                            app.actions
+                                .push(Action::SetSkin(Some(choices[kept[picked]].name.clone())));
+                        }
                     }
                 });
             }
+            app.winamp.previews.finish();
             filtered_row(ui, &palette, &needle, &mini_player, &mini_rows[3], |ui| {
                 let mut random = app.settings.random_skin;
                 if widgets::switch(ui, &palette, &random_skin, &mut random).changed() {
@@ -2296,7 +2347,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .unwrap_or(usize::MAX);
             let eq_extra_visible = equalizer_rows[1].matches(&needle, &equalizer);
             if eq_extra_visible {
-                if let Some(picked) = widgets::chips(ui, &palette, &names, current) {
+                if let Some(picked) = widgets::wrapped_chips(ui, &palette, &names, current) {
                     app.actions.push(match picked.checked_sub(built_in) {
                         Some(user) => Action::ApplyUserEqPreset(user_presets[user].name.clone()),
                         None => Action::ApplyEqPreset(picked),

@@ -5,6 +5,11 @@
 //! one event loop per process and eframe owns the main one. Audio reaches the
 //! child through a shared-memory ring.
 //!
+//! The same child can draw without a window of its own and publish frames to
+//! shared memory ([`frames`]), for the app to show inside a skin ([`pane`]).
+//! projectM stays out of the app's process either way: on egui's thread it
+//! would freeze the interface.
+//!
 //! [`Presets`] lists the config directory's `milkdrop` folder and downloads
 //! optional projectM preset packs. No presets are bundled.
 
@@ -17,11 +22,20 @@ use std::time::{Duration, Instant};
 pub mod child;
 #[cfg(feature = "milkdrop")]
 pub mod engine;
+/// Finished frames in shared memory, from the child to a skin's pane.
+#[cfg(feature = "milkdrop")]
+pub mod frames;
 /// The app's side of the child process: spawning it and talking to it.
 #[cfg(feature = "milkdrop")]
 pub mod host;
+/// The child's mode with no window, drawing frames for a pane.
+#[cfg(feature = "milkdrop")]
+mod offscreen;
 /// Fading text over the picture: the keys, the playing song.
 pub mod overlay;
+/// The app's side of a pane's picture: the stream of frames and its child.
+#[cfg(feature = "milkdrop")]
+pub mod pane;
 /// The shared-memory audio ring between the app and the MilkDrop child.
 #[cfg(feature = "milkdrop")]
 pub mod shm;
@@ -408,6 +422,17 @@ fn walk(folder: &Path, depth: usize, files: &mut Vec<PathBuf>) {
             files.push(path);
         }
     }
+}
+
+/// The program to start MilkDrop's child from. An update that replaces the
+/// running file leaves `current_exe` naming nothing, but Linux keeps the
+/// running file reachable through `/proc`.
+pub(crate) fn this_program() -> std::io::Result<std::path::PathBuf> {
+    let own = Path::new("/proc/self/exe");
+    if cfg!(target_os = "linux") && own.exists() {
+        return Ok(own.to_path_buf());
+    }
+    std::env::current_exe()
 }
 
 /// Whether the folder holds a preset, looking no further than the first:

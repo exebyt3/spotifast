@@ -32,6 +32,20 @@ pub fn marquee_strip(text: &str) -> String {
 }
 /// How long a listing of the skins folder is trusted.
 const CHOICES_FRESH: Duration = Duration::from_secs(5);
+/// Where a skin's own preferences are kept: beside the skins, in a folder
+/// no skin listing looks in.
+pub fn skin_preferences_path(folder: &Path, name: &str) -> PathBuf {
+    let parent = folder.parent().unwrap_or(folder);
+    parent.join("skin-preferences").join(format!("{name}.json"))
+}
+
+fn read_preferences(path: &Path) -> HashMap<String, String> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
 /// File extensions a skin archive may carry.
 const ARCHIVE_EXTENSIONS: [&str; 3] = ["wsz", "wmz", "zip"];
 
@@ -72,7 +86,19 @@ pub struct Loaded {
     pub result: Result<Skin, SkinError>,
     /// Whether the skin was just copied into the folder.
     pub installed: bool,
+    /// What a Windows Media Player skin saved last time.
+    pub preferences: HashMap<String, String>,
 }
+
+struct WmpTexture {
+    handle: egui::TextureHandle,
+    _picture: Arc<crate::skin::wmp::picture::Picture>,
+    bytes: usize,
+    used: u64,
+}
+
+/// The most a skin's pictures may take on the graphics card, in bytes.
+const MAX_WMP_TEXTURES: usize = 192 * 1024 * 1024;
 
 pub struct WinampState {
     /// The skin on screen.
@@ -82,8 +108,21 @@ pub struct WinampState {
     /// The skin's sheets on the graphics card, made on demand and dropped
     /// with the window, since textures belong to a window's context.
     textures: HashMap<Sheet, egui::TextureHandle>,
-    /// A Windows Media Player skin's pictures, by their keys.
-    wmp_textures: HashMap<String, egui::TextureHandle>,
+    /// Scripts the demo runs in the skin once it has started.
+    #[cfg(feature = "demo")]
+    pub demo_scripts: Vec<String>,
+    /// Keep the tap fed, so that MilkDrop has the demo's sound to answer.
+    #[cfg(feature = "demo")]
+    pub demo_sounding: bool,
+    /// The running Windows Media Player skin.
+    pub runtime: Option<crate::skin::wmp::runtime::Runtime>,
+    /// Its saved preferences, read with the skin, until it starts.
+    skin_preferences: HashMap<String, String>,
+    /// Its pictures' frames on the graphics card, keyed by which picture
+    /// and frame; holding the picture keeps its address from being reused.
+    wmp_textures: HashMap<(usize, usize), WmpTexture>,
+    wmp_texture_bytes: usize,
+    wmp_texture_clock: u64,
     loading: Option<mpsc::Receiver<Loaded>>,
     /// The skins folder's contents, as last listed.
     pub choices: Vec<SkinChoice>,
@@ -92,6 +131,13 @@ pub struct WinampState {
     listing: Option<mpsc::Receiver<Vec<SkinChoice>>>,
     /// Whether `choices` holds a finished listing yet.
     choices_known: bool,
+    /// Counts the listings, so the previews see each new one.
+    choices_generation: u64,
+    /// Pictures of the skins, for their cards in Settings.
+    pub previews: crate::skin_previews::SkinPreviews,
+    /// What the demo types in the Settings filter.
+    #[cfg(feature = "demo")]
+    pub demo_settings_filter: Option<String>,
     /// Count down instead of up; clicking the time toggles it.
     pub time_remaining: bool,
     /// The balance while its thumb is held, for the marquee to report.
@@ -119,6 +165,8 @@ pub struct WinampState {
     pub playlist_selection: std::collections::HashSet<usize>,
     pub playlist_wheel: f32,
     pub playlist_resize: f32,
+    /// The same for the MilkDrop panel.
+    pub milkdrop_resize: f32,
     /// The playlist's rows as Winamp drew them, kept once drawn.
     pub playlist_text: crate::ui::winamp::PixelText,
     /// MilkDrop presets listed and downloaded from Settings.
@@ -131,12 +179,24 @@ impl WinampState {
             skin: Skin::builtin(),
             worn: None,
             textures: HashMap::new(),
+            #[cfg(feature = "demo")]
+            demo_scripts: Vec::new(),
+            #[cfg(feature = "demo")]
+            demo_sounding: false,
+            runtime: None,
+            skin_preferences: HashMap::new(),
             wmp_textures: HashMap::new(),
+            wmp_texture_bytes: 0,
+            wmp_texture_clock: 0,
             loading: None,
             choices: Vec::new(),
             choices_listed: None,
             listing: None,
             choices_known: false,
+            choices_generation: 0,
+            previews: crate::skin_previews::SkinPreviews::default(),
+            #[cfg(feature = "demo")]
+            demo_settings_filter: None,
             time_remaining: false,
             balance_preview: None,
             open_presets: false,
@@ -154,6 +214,7 @@ impl WinampState {
             playlist_selection: std::collections::HashSet::new(),
             playlist_wheel: 0.0,
             playlist_resize: 0.0,
+            milkdrop_resize: 0.0,
             playlist_text: crate::ui::winamp::PixelText::default(),
             presets: crate::milkdrop::Presets::new(),
         }
@@ -187,13 +248,16 @@ impl WinampState {
         self.worn = name;
         self.textures.clear();
         self.wmp_textures.clear();
+        self.wmp_texture_bytes = 0;
     }
 
     /// The window is gone (or about to be), and with it the textures.
     pub fn forget_textures(&mut self) {
         self.textures.clear();
         self.wmp_textures.clear();
+        self.wmp_texture_bytes = 0;
         self.playlist_text.clear();
+        self.previews.forget_textures();
     }
 
     /// The skin's sheets as textures, made now if they are not yet.
@@ -220,35 +284,74 @@ impl WinampState {
             .collect()
     }
 
-    /// The Windows Media Player skin's pictures as textures, made now if
-    /// they are not yet. Empty for a Winamp skin.
-    pub fn wmp_textures(&mut self, ctx: &egui::Context) -> HashMap<String, egui::TextureId> {
-        let Some(wmp) = self.skin.wmp.as_ref() else {
-            return HashMap::new();
-        };
-        for (key, bitmap) in &wmp.images {
-            if self.wmp_textures.contains_key(key) {
-                continue;
-            }
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [bitmap.width as usize, bitmap.height as usize],
-                &bitmap.rgba,
-            );
-            let handle =
-                ctx.load_texture(format!("wmp-{key}"), image, egui::TextureOptions::NEAREST);
-            self.wmp_textures.insert(key.clone(), handle);
+    /// A frame of a skin's picture as a texture, made now if it is not yet.
+    pub fn wmp_texture(
+        &mut self,
+        ctx: &egui::Context,
+        picture: &Arc<crate::skin::wmp::picture::Picture>,
+        frame: usize,
+    ) -> egui::TextureId {
+        self.wmp_texture_clock += 1;
+        let clock = self.wmp_texture_clock;
+        let key = (Arc::as_ptr(picture) as usize, frame);
+        if let Some(texture) = self.wmp_textures.get_mut(&key) {
+            texture.used = clock;
+            return texture.handle.id();
         }
-        self.wmp_textures
-            .iter()
-            .map(|(key, handle)| (key.clone(), handle.id()))
-            .collect()
+        let bitmap = &picture.frames[frame].bitmap;
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [bitmap.width as usize, bitmap.height as usize],
+            &bitmap.rgba,
+        );
+        let handle = ctx.load_texture("wmp-picture", image, egui::TextureOptions::NEAREST);
+        let id = handle.id();
+        self.wmp_texture_bytes += bitmap.rgba.len();
+        self.wmp_textures.insert(
+            key,
+            WmpTexture {
+                handle,
+                _picture: picture.clone(),
+                bytes: bitmap.rgba.len(),
+                used: clock,
+            },
+        );
+        id
+    }
+
+    /// Lets go of the longest unused frames once too many are held: a skin
+    /// that plays an intro of hundreds of pictures needs them only once.
+    pub fn trim_wmp_textures(&mut self) {
+        while self.wmp_texture_bytes > MAX_WMP_TEXTURES && self.wmp_textures.len() > 1 {
+            let Some(oldest) = self
+                .wmp_textures
+                .iter()
+                .min_by_key(|(_, texture)| texture.used)
+                .map(|(key, _)| *key)
+            else {
+                return;
+            };
+            if let Some(texture) = self.wmp_textures.remove(&oldest) {
+                self.wmp_texture_bytes = self.wmp_texture_bytes.saturating_sub(texture.bytes);
+            }
+        }
+    }
+
+    /// The running skin's saved preferences, to hand it as it starts.
+    pub fn take_skin_preferences(&mut self) -> HashMap<String, String> {
+        std::mem::take(&mut self.skin_preferences)
+    }
+
+    pub fn set_skin_preferences(&mut self, preferences: HashMap<String, String>) {
+        self.skin_preferences = preferences;
     }
 
     /// Reads a skin from the folder on another thread.
     pub fn load(&mut self, name: String, folder: &Path, ctx: &egui::Context) {
         let path = folder.join(&name);
+        let preferences = skin_preferences_path(folder, &name);
         self.spawn(ctx, move || Loaded {
-            result: Skin::load(&path),
+            result: Skin::shipped(&name).unwrap_or_else(|| Skin::load(&path)),
+            preferences: read_preferences(&preferences),
             name,
             installed: false,
         });
@@ -275,6 +378,7 @@ impl WinampState {
                 name,
                 result,
                 installed: true,
+                preferences: HashMap::new(),
             }
         });
     }
@@ -334,7 +438,7 @@ impl WinampState {
         let spawned = std::thread::Builder::new()
             .name("skin-lister".into())
             .spawn(move || {
-                let _ = sender.send(list_skins(&folder));
+                let _ = sender.send(with_shipped_skins(list_skins(&folder)));
                 ctx.request_repaint();
             });
         match spawned {
@@ -352,11 +456,17 @@ impl WinampState {
             Ok(choices) => {
                 self.choices = choices;
                 self.choices_known = true;
+                self.choices_generation += 1;
                 self.listing = None;
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => self.listing = None,
         }
+    }
+
+    /// Which listing `choices` is, counted from the first.
+    pub fn choices_generation(&self) -> u64 {
+        self.choices_generation
     }
 
     /// Whether a listing has come back since the app started.
@@ -432,6 +542,19 @@ pub fn list_skins(folder: &Path) -> Vec<SkinChoice> {
         .collect();
     skins.sort_by_key(|skin| skin.name.to_lowercase());
     skins
+}
+
+/// What is in the skins folder, after what comes with the app.
+fn with_shipped_skins(listed: Vec<SkinChoice>) -> Vec<SkinChoice> {
+    let shipped = crate::skin::SHIPPED.map(|name| SkinChoice {
+        name: name.to_owned(),
+        path: PathBuf::new(),
+        kind: SkinKind::WindowsMediaPlayer,
+    });
+    let listed = listed
+        .into_iter()
+        .filter(|skin| !crate::skin::SHIPPED.contains(&skin.name.as_str()));
+    shipped.into_iter().chain(listed).collect()
 }
 
 /// What an archive holds, by its file names alone. One that cannot be read

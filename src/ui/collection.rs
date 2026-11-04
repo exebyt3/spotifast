@@ -927,6 +927,33 @@ fn table_contents(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
         }
     };
     app.keep_picked_rows_for(&table.page, &view);
+    // A song's link opened this page. Waiting out a load keeps the arriving
+    // rows from clearing the pick, and a long album loads until the song
+    // turns up.
+    if !table.loading
+        && let Some(uris) = app.linked_song(&table.page).cloned()
+    {
+        let row = (0..rows).find(|row| {
+            item_index(*row)
+                .and_then(|index| table.items.get(index))
+                .is_some_and(|(item, _, _)| uris.iter().any(|uri| uri == item.uri()))
+        });
+        if let Some(row) = row {
+            app.pick_rows(&table.page, &view, [row].into_iter().collect());
+            app.finish_linked_song();
+            ui.scroll_to_rect(
+                Rect::from_min_size(
+                    pos2(ui.max_rect().left(), list_top + row as f32 * row_height),
+                    vec2(ui.max_rect().width(), row_height),
+                ),
+                Some(egui::Align::Center),
+            );
+        } else if table.can_load_more && table.error.is_none() {
+            app.actions.push(Action::LoadMore(table.page.clone()));
+        } else {
+            app.finish_linked_song();
+        }
+    }
     let picked: std::collections::BTreeSet<usize> =
         app.picked_rows(&table.page).cloned().unwrap_or_default();
     // Keep complete rows for immediate optimistic playlist additions.
@@ -1141,8 +1168,9 @@ fn table_contents(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
     }
 }
 
-/// Select all, Cut, Copy, Paste and Delete on a song list. Cut copies the picked
-/// songs and removes them from a playlist the account can edit. A focused
+/// Select all, Cut, Copy, Paste, Delete, and the queue keys on a song list. Cut
+/// copies the picked songs and removes them from a playlist the account can
+/// edit. A focused
 /// text field keeps these keys for its own text, and an open dialog keeps
 /// them from the list behind it.
 fn list_shortcuts(
@@ -1175,7 +1203,8 @@ fn list_shortcuts(
     let can_delete = editable.is_some()
         && app.picked_rows(&table.page).is_some()
         && !egui::Popup::is_any_open(ui.ctx());
-    let (select_all, cut, copy, pasted, delete) = ui.input_mut(|input| {
+    let queue_keys = !picked_songs.is_empty() && !egui::Popup::is_any_open(ui.ctx());
+    let (select_all, cut, copy, pasted, delete, queue, play_next) = ui.input_mut(|input| {
         // The platform's Cut, Copy and Paste keys arrive as these events,
         // not as key presses.
         let cut = editable.is_some()
@@ -1203,8 +1232,26 @@ fn list_shortcuts(
                 && (input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
                     || (cfg!(target_os = "macos")
                         && input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace))),
+            queue_keys && first_shift_press(input, egui::Key::Q),
+            queue_keys && first_shift_press(input, egui::Key::N),
         )
     });
+    // As the selection's menu: local files queue only on this computer's
+    // player, and the others in the selection still go.
+    let queueable = picked_songs.iter().any(|song| app.can_queue(song.uri()));
+    if queue && queueable {
+        app.actions.push(Action::QueueMany {
+            songs: picked_songs
+                .iter()
+                .map(|song| (song.uri().to_string(), song.name().to_string()))
+                .collect(),
+        });
+    }
+    if play_next && queueable && app.queue_locally_reorderable() {
+        app.actions.push(Action::PlayNext {
+            items: picked_songs.clone(),
+        });
+    }
     if select_all {
         let all = (0..rows)
             .filter(|row| {
@@ -1248,6 +1295,16 @@ fn list_shortcuts(
     if let (Some(playlist_id), Some(text)) = (editable, pasted) {
         app.actions.push(Action::PasteSongs { playlist_id, text });
     }
+}
+
+/// Whether Shift+`key` was pressed, taking its presses. The repeats of a held
+/// key count for nothing, so holding it does not queue the songs over and over.
+fn first_shift_press(input: &mut egui::InputState, key: egui::Key) -> bool {
+    let first = input.events.iter().any(|event| {
+        matches!(event, egui::Event::Key { key: pressed, pressed: true, repeat: false, modifiers, .. }
+            if *pressed == key && modifiers.shift_only())
+    });
+    input.consume_key(egui::Modifiers::SHIFT, key) && first
 }
 
 /// Arrow keys follow display order, independent of the positions of the
@@ -4186,6 +4243,165 @@ mod tests {
     /// Select all takes every song the list shows, Copy hands the picked
     /// songs on in the list's order, and Paste offers an editable playlist
     /// the clipboard's text. A focused text field keeps all three keys.
+    /// A song's link picks its row and brings it into view, however far down
+    /// the list it is, and leaves the pick alone afterwards (#1117).
+    #[test]
+    fn a_linked_song_is_picked_and_scrolled_to() {
+        // #given a list taller than the window, opened for its last song
+        let mut table = KeyboardTable::new();
+        table.items = (0..200)
+            .map(|i| {
+                let mut row = make_test_tracks().remove(0);
+                if let PlayableItem::Track(track) = &mut row.0 {
+                    track.uri = format!("spotify:track:t_{i}");
+                    track.name = format!("Track {i}");
+                }
+                row
+            })
+            .collect();
+        let page = Page::Playlist("test".into());
+        table.app.link_song_for_test(
+            page.clone(),
+            ["spotify:track:t_150".into(), "spotify:track:t_150".into()],
+        );
+
+        // #when the list is drawn
+        table.frame(Vec::new());
+        let tree = table.frame(Vec::new());
+
+        // #then the row is picked, drawn, and the link is spent
+        assert_eq!(
+            table.app.picked_rows(&page).cloned(),
+            Some(std::collections::BTreeSet::from([150]))
+        );
+        assert!(table.app.linked_song(&page).is_none());
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|(_, node)| node.label().is_some_and(|name| name.contains("Track 150"))),
+            "the linked row is on screen"
+        );
+
+        // #when the user clears the pick
+        table.app.clear_picked_rows();
+        table.frame(Vec::new());
+
+        // #then the spent link does not pick it again
+        assert_eq!(table.app.picked_rows(&page), None);
+    }
+
+    /// A song the finished list does not hold is let go of, not waited for.
+    #[test]
+    fn a_linked_song_the_list_does_not_hold_is_let_go() {
+        // #given
+        let mut table = KeyboardTable::new();
+        let page = Page::Playlist("test".into());
+        let missing = "spotify:track:missing".to_string();
+        table
+            .app
+            .link_song_for_test(page.clone(), [missing.clone(), missing]);
+
+        // #when the whole list is there without the song
+        table.frame(Vec::new());
+
+        // #then nothing is picked and nothing waits
+        assert_eq!(table.app.picked_rows(&page), None);
+        assert!(table.app.linked_song(&page).is_none());
+    }
+
+    /// Shift+Q queues the picked songs in list order, once however long the
+    /// key is held, and does nothing without a pick (#1110).
+    #[test]
+    fn shift_q_queues_the_picked_songs() {
+        // #given
+        let mut table = KeyboardTable::new();
+        let shift_q = |pressed| egui::Event::Key {
+            key: egui::Key::Q,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+
+        // #when nothing is picked
+        table.frame(vec![shift_q(true), shift_q(false)]);
+
+        // #then
+        assert!(table.app.actions.is_empty());
+
+        // #when two songs are picked
+        table.focus_song("Bohemian Rhapsody");
+        table.key(egui::Key::ArrowDown);
+        table.modified_key(egui::Key::ArrowDown, egui::Modifiers::SHIFT);
+        table.frame(vec![shift_q(true)]);
+        let [Action::QueueMany { songs }] = table.app.actions.as_slice() else {
+            panic!("expected one queue action: {:?}", table.app.actions);
+        };
+
+        // #then
+        assert_eq!(
+            songs.iter().map(|song| song.0.as_str()).collect::<Vec<_>>(),
+            ["spotify:track:t_1", "spotify:track:t_2"]
+        );
+        table.app.actions.clear();
+
+        // #when the key is held
+        table.frame(vec![shift_q(true), shift_q(true)]);
+
+        // #then egui reports repeats, and they queue nothing
+        assert!(table.app.actions.is_empty());
+        table.frame(vec![shift_q(false)]);
+
+        // #when a text field has focus
+        table
+            .ctx
+            .memory_mut(|memory| memory.request_focus(egui::Id::new("keyboard-filter")));
+        table.frame(Vec::new());
+        table.frame(vec![shift_q(true), shift_q(false)]);
+
+        // #then the field keeps the key
+        assert!(table.app.actions.is_empty());
+    }
+
+    /// Shift+N plays the picked songs next where the queue can be rewritten,
+    /// and is off elsewhere, like the menu item (#1110).
+    #[test]
+    fn shift_n_plays_the_picked_songs_next_on_this_computer() {
+        // #given a picked song with no local player
+        let mut table = KeyboardTable::new();
+        table.focus_song("Bohemian Rhapsody");
+        table.key(egui::Key::ArrowDown);
+
+        // #when
+        table.modified_key(egui::Key::N, egui::Modifiers::SHIFT);
+
+        // #then
+        assert!(table.app.actions.is_empty());
+
+        // #when this computer is playing
+        table.frame(vec![egui::Event::Key {
+            key: egui::Key::N,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        }]);
+        table.app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:playing".into(),
+            ..Default::default()
+        });
+        table.app.local.playback = crate::player::Playback::Playing;
+        table.app.local_ready = true;
+        table.modified_key(egui::Key::N, egui::Modifiers::SHIFT);
+
+        // #then
+        let [Action::PlayNext { items }] = table.app.actions.as_slice() else {
+            panic!("expected play next: {:?}", table.app.actions);
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].uri(), "spotify:track:t_1");
+    }
+
     #[test]
     fn select_all_copy_and_paste_act_on_the_song_list() {
         // The modifiers as the platform reports its command key.

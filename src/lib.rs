@@ -19,6 +19,8 @@ pub mod emoji;
 pub mod eq;
 pub mod history;
 pub mod http;
+#[cfg(target_os = "linux")]
+pub mod hyprland;
 pub mod i18n;
 pub mod images;
 pub mod liked;
@@ -53,6 +55,7 @@ pub mod settings;
 pub mod single_instance;
 pub mod sink;
 pub mod skin;
+pub mod skin_previews;
 pub mod soloist;
 pub mod sonos;
 mod storage;
