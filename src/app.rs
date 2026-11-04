@@ -657,6 +657,10 @@ pub struct App {
     /// Last list sent to local playback. Used for autoplay because librespot
     /// cannot continue a list without a context URI.
     local_list: Option<Vec<String>>,
+    /// When Next was last pressed for local playback. librespot stops on Next
+    /// only when nothing follows, so a stop right after it is the end of the
+    /// context, wherever in the song it came.
+    local_next_at: Option<Instant>,
     /// Activated receiver waiting to appear in Spotify's device list.
     pending_transfer_to: Option<(String, Instant)>,
     /// When to take a confirming look at remote playback after a command.
@@ -1303,6 +1307,7 @@ impl App {
             pending_play_at: None,
             queued_play: None,
             local_list: None,
+            local_next_at: None,
             pending_transfer_to: None,
             remote_recheck_at: None,
             remote_pushed_at: None,
@@ -3641,14 +3646,16 @@ impl App {
         if let Some(seed) = autoplay_seed(
             self.local_list.as_deref(),
             self.settings.autoplay,
+            self.local_next_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(5)),
             &self.local,
             &state,
         ) {
             log::info!("playback ended; playing what Spotify follows {seed} with");
             self.local_list = None;
-            // librespot's autoplay endpoint answers 400 now, and the load then
-            // falls back to the context's first song. The radio station of the
-            // last song is what the Radio page plays, and it resolves.
+            self.local_next_at = None;
+            // librespot's own autoplay does not carry on here. The radio station
+            // of the last song is what the Radio page plays, and it resolves.
             let station = crate::util::station_uri(&seed);
             self.backend.player(PlayerCommand::Load(LoadSpec {
                 autoplay: station.is_none(),
@@ -11812,7 +11819,10 @@ impl App {
                     self.pop_queue_head();
                 }
                 match target {
-                    Target::Local => self.backend.player(PlayerCommand::Next),
+                    Target::Local => {
+                        self.local_next_at = Some(Instant::now());
+                        self.backend.player(PlayerCommand::Next);
+                    }
                     Target::Remote(device_id) => self.remote(RemoteAction::Next, device_id),
                 }
             }
@@ -14420,6 +14430,7 @@ fn local_load(request: &PlayRequest, shuffle: bool) -> LoadSpec {
 fn autoplay_seed(
     list: Option<&[String]>,
     autoplay: bool,
+    skipped: bool,
     before: &LocalState,
     after: &LocalState,
 ) -> Option<String> {
@@ -14440,7 +14451,7 @@ fn autoplay_seed(
         return None;
     }
     let near_end = before.position_now() + 3_000 >= track.duration_ms;
-    near_end.then(|| track.uri.clone())
+    (near_end || skipped).then(|| track.uri.clone())
 }
 
 /// The most songs a plain track list hands the player.
@@ -32597,12 +32608,12 @@ mod tests {
         };
         let list: Vec<String> = vec!["spotify:track:first".into(), "spotify:track:last".into()];
         assert_eq!(
-            autoplay_seed(Some(&list), true, &playing, &stopped).as_deref(),
+            autoplay_seed(Some(&list), true, false, &playing, &stopped).as_deref(),
             Some("spotify:track:last")
         );
-        assert_eq!(autoplay_seed(Some(&list), false, &playing, &stopped), None);
+        assert_eq!(autoplay_seed(Some(&list), false, false, &playing, &stopped), None);
         assert_eq!(
-            autoplay_seed(None, true, &playing, &stopped).as_deref(),
+            autoplay_seed(None, true, false, &playing, &stopped).as_deref(),
             Some("spotify:track:last"),
             "a context librespot did not carry on from"
         );
@@ -32610,23 +32621,28 @@ mod tests {
             track: track("spotify:episode:e"),
             ..playing.clone()
         };
-        assert_eq!(autoplay_seed(None, true, &episode, &stopped), None);
+        assert_eq!(autoplay_seed(None, true, false, &episode, &stopped), None);
         let mid_song = LocalState {
             position_ms: 60_000,
             ..playing.clone()
         };
-        assert_eq!(autoplay_seed(Some(&list), true, &mid_song, &stopped), None);
-        assert_eq!(autoplay_seed(None, true, &mid_song, &stopped), None);
+        assert_eq!(autoplay_seed(Some(&list), true, false, &mid_song, &stopped), None);
+        assert_eq!(autoplay_seed(None, true, false, &mid_song, &stopped), None);
+        assert_eq!(
+            autoplay_seed(None, true, true, &mid_song, &stopped).as_deref(),
+            Some("spotify:track:last"),
+            "Next on the last song stops mid-song"
+        );
         let not_last = LocalState {
             track: track("spotify:track:first"),
             ..playing.clone()
         };
-        assert_eq!(autoplay_seed(Some(&list), true, &not_last, &stopped), None);
+        assert_eq!(autoplay_seed(Some(&list), true, false, &not_last, &stopped), None);
         let dropped = LocalState {
             connected: false,
             ..stopped.clone()
         };
-        assert_eq!(autoplay_seed(Some(&list), true, &playing, &dropped), None);
+        assert_eq!(autoplay_seed(Some(&list), true, false, &playing, &dropped), None);
     }
 
     fn snapshot_at(percent: u8) -> LocalState {
