@@ -3660,7 +3660,8 @@ impl App {
             self.backend.player(PlayerCommand::Load(LoadSpec {
                 autoplay: station.is_none(),
                 context_uri: Some(station.unwrap_or(seed)),
-                play: true,
+                // Next keeps a paused song paused, here as on any other row.
+                play: self.local.playback != Playback::Paused,
                 ..LoadSpec::default()
             }));
         }
@@ -14437,7 +14438,8 @@ fn autoplay_seed(
     if !autoplay
         || !after.connected
         || after.playback != Playback::Stopped
-        || before.playback != Playback::Playing
+        || (before.playback != Playback::Playing
+            && !(skipped && before.playback != Playback::Stopped))
     {
         return None;
     }
@@ -32632,6 +32634,16 @@ mod tests {
             autoplay_seed(None, true, true, &mid_song, &stopped).as_deref(),
             Some("spotify:track:last"),
             "Next on the last song stops mid-song"
+        );
+        let paused = LocalState {
+            playback: Playback::Paused,
+            ..mid_song.clone()
+        };
+        assert_eq!(autoplay_seed(None, true, false, &paused, &stopped), None);
+        assert_eq!(
+            autoplay_seed(None, true, true, &paused, &stopped).as_deref(),
+            Some("spotify:track:last"),
+            "Next on the last song while paused"
         );
         let not_last = LocalState {
             track: track("spotify:track:first"),
