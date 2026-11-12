@@ -48,6 +48,8 @@ one-time pairing and automatic renewal of expiring builds. New listeners and
 people updating see this choice once after sign-in on supported platforms.
 **Use the built-in player** keeps librespot, with Spotifast's EQ, visualizers,
 local files and full queue editing. The choice is remembered.
+The built-in player reconnects after a connection drop, including when the
+old session gets stuck cleaning up its network connection.
 On Linux with PipeWire, Soloist also supports Spotifast’s EQ and visualizers
 through a private audio route. [Native audio support](https://spotifast.rocks/soloist/#native-audio)
 adds EQ and visualizers on macOS 14.2 or newer, and visualizers on Windows 11,

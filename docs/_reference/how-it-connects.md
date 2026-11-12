@@ -638,6 +638,11 @@ does not save or log the token.
 Playback runs on a separate runtime. Librespot maintains the Spotify Connect
 session, exposes this computer as a device, receives transfers, and reports
 playback state. If the session drops, it reconnects with the stored credential.
+A dead session gets two seconds to finish Connect cleanup before that task is
+cancelled, so an unreachable server cannot hold up reconnection. Closing its
+control connection also has a two-second deadline. The player keeps fetched
+audio while a replacement session connects; if no complete Connect snapshot
+is available, recovery uses the current track and position.
 On macOS, while the system reports no route to the internet at all, the
 reconnection waits for one instead of retrying. Spotifast asks the system
 about the internet as a whole rather than about a Spotify host, so the check

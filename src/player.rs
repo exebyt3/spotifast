@@ -612,8 +612,17 @@ impl Engine {
         let ended_notify = Arc::clone(&notify);
         let ended_state = Arc::clone(&state);
         let ended_interrupted = Arc::clone(&interrupted);
+        let ended_session = session.clone();
         tokio::spawn(async move {
-            spirc_task.await;
+            finish_session_task(spirc_task, || {
+                ended_session.is_invalid()
+                    || ended_flag.load(std::sync::atomic::Ordering::SeqCst)
+                    || ended_closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .await;
+            ended_session.shutdown();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(2), ended_session.dealer().close()).await;
             let shut_down = ended_flag.load(std::sync::atomic::Ordering::SeqCst);
             {
                 let mut current = ended_state.lock().unwrap_or_else(|p| p.into_inner());
@@ -991,6 +1000,23 @@ fn resume_from(resume: PlaybackResume, now: Option<&Interrupted>) -> PlaybackRes
                 spec.play = now.playing;
             }
             PlaybackResume::Track(spec)
+        }
+    }
+}
+
+async fn finish_session_task(task: impl std::future::Future<Output = ()>, ended: impl Fn() -> bool) {
+    tokio::pin!(task);
+    tokio::select! {
+        () = &mut task => {},
+        () = async {
+            while !ended() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        } => {
+            // Spirc's network cleanup can hang after the session is already dead.
+            if tokio::time::timeout(Duration::from_secs(2), &mut task).await.is_err() {
+                log::warn!("Spotify session ended; abandoning stalled Connect cleanup");
+            }
         }
     }
 }
@@ -1483,6 +1509,36 @@ fn read_lyrics(bytes: &[u8]) -> (Option<serde_json::Value>, String) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_session_does_not_wait_forever_for_spirc_cleanup() {
+        let start = tokio::time::Instant::now();
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        let task = async move {
+            let _guard = sender;
+            std::future::pending::<()>().await;
+        };
+        finish_session_task(task, || start.elapsed() >= Duration::from_secs(1)).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+        assert!(
+            receiver.await.is_err(),
+            "the old task must be dropped before reconnecting"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_session_is_not_timed_out() {
+        let start = tokio::time::Instant::now();
+        finish_session_task(tokio::time::sleep(Duration::from_secs(30)), || false).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_session_can_finish_its_snapshot_before_cleanup_is_cancelled() {
+        let start = tokio::time::Instant::now();
+        finish_session_task(tokio::time::sleep(Duration::from_secs(1)), || true).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
     #[test]
     fn loading_another_song_keeps_repeat_with_or_without_shuffle() {
         for shuffle in [None, Some(false), Some(true)] {
