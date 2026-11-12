@@ -1004,7 +1004,10 @@ fn resume_from(resume: PlaybackResume, now: Option<&Interrupted>) -> PlaybackRes
     }
 }
 
-async fn finish_session_task(task: impl std::future::Future<Output = ()>, ended: impl Fn() -> bool) {
+async fn finish_session_task(
+    task: impl std::future::Future<Output = ()>,
+    ended: impl Fn() -> bool,
+) {
     tokio::pin!(task);
     tokio::select! {
         () = &mut task => {},
