@@ -1500,7 +1500,7 @@ impl App {
             user_names_revision: 0,
             user_images: HashMap::new(),
             recent_contexts: session.recent_contexts.clone(),
-            resume_context: session.last_context.clone(),
+            resume_context: session.last_context.filter(|uri| playable_context_uri(uri)),
             resume_track: session.last_track.clone(),
             resume_position_ms: session.last_position_ms,
             resume_load: None,
@@ -8396,9 +8396,12 @@ impl App {
                             .remote
                             .as_ref()
                             .map(|remote| remote.state.shuffle_state);
-                        self.remote = state.map(|state| RemoteSnapshot {
-                            state,
-                            received_at: Instant::now(),
+                        self.remote = state.map(|mut state| {
+                            state.context = state.context.filter(|c| playable_context_uri(&c.uri));
+                            RemoteSnapshot {
+                                state,
+                                received_at: Instant::now(),
+                            }
                         });
                         if let (Some(previous), Some(current)) = (
                             previous_shuffle,
@@ -15508,6 +15511,12 @@ fn remote_action_label(locale: Locale, action: RemoteAction) -> Cow<'static, str
     }
 }
 
+/// librespot labels an explicit list of tracks with this placeholder.
+/// It has no tracks to resolve on Spotify after a restart.
+fn playable_context_uri(uri: &str) -> bool {
+    !matches!(uri, "" | "spotify:web-api")
+}
+
 /// Availability explicitly reported for a song; session-only rows are unknown.
 fn known_availability(items: &[PlaylistItem]) -> impl Iterator<Item = (&str, bool)> {
     items.iter().filter_map(|item| match item.playable()? {
@@ -19925,6 +19934,81 @@ mod tests {
             request.position_ms, 19_566,
             "the song resumes where it stopped, not at zero"
         );
+    }
+
+    #[test]
+    fn play_after_restart_ignores_the_web_api_track_list_placeholder() {
+        let root =
+            std::env::temp_dir().join(format!("spotifast-resume-list-{}", std::process::id()));
+        let dirs = AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        };
+        std::fs::create_dir_all(&dirs.state).unwrap();
+        let song = "spotify:track:saved";
+        SessionState {
+            last_context: Some("spotify:web-api".into()),
+            last_track: Some(song.into()),
+            last_position_ms: 32_609,
+            ..Default::default()
+        }
+        .save(&dirs.session_file());
+        let mut app = App::new(
+            &Waker::default(),
+            dirs,
+            Settings::default(),
+            AppOptions {
+                media_controls: false,
+                restore_sign_in: false,
+                tray: false,
+                autostart: false,
+            },
+        );
+        app.local_ready = true;
+        app.local.connected = true;
+        app.local_device_id = Some("this-computer".into());
+
+        // Before the first Spotify poll, Play only has the old session.
+        app.toggle_play();
+        let check_load = |app: &App| {
+            let load = app
+                .backend
+                .take_player_commands()
+                .into_iter()
+                .find_map(|cmd| match cmd {
+                    PlayerCommand::Load(spec) => Some(spec),
+                    _ => None,
+                })
+                .expect("Play loads the saved song");
+            assert_eq!(load.context_uri.as_deref(), Some(song));
+            assert_eq!(load.position_ms, 32_609);
+            assert!(load.play);
+        };
+        check_load(&app);
+
+        // A later poll can report the same placeholder for the paused song.
+        app.handle_api(ApiResponse::PlaybackState {
+            seq: app.remote_poll_seq,
+            result: Ok(Some(PlaybackState {
+                device: Some(Device {
+                    id: app.local_device_id.clone(),
+                    ..Default::default()
+                }),
+                context: Some(crate::api::models::Context {
+                    uri: "spotify:web-api".into(),
+                    ..Default::default()
+                }),
+                item: Some(queued_song(song)),
+                progress_ms: Some(32_609),
+                ..Default::default()
+            })),
+        });
+        assert!(app.remote.as_ref().unwrap().state.context.is_none());
+        app.toggle_play();
+        check_load(&app);
+        app.backend.shutdown();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Play on an in-progress episode continues from the place the row or
